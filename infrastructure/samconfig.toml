@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "coach-trading-platform"
+resolve_s3 = true
+s3_prefix = "coach-trading-platform"
+region = "ap-south-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+parameter_overrides = "TelegramAuthorizedUserId=\"5721278623\" GrowwSecretArn=\"arn:aws:secretsmanager:ap-south-1:126119524097:secret:coach-trading/groww-i6Lhzo\" GoogleSecretArn=\"arn:aws:secretsmanager:ap-south-1:126119524097:secret:coach-trading/google-V3HEh1\" TelegramBotTokenSecretArn=\"arn:aws:secretsmanager:ap-south-1:126119524097:secret:coach-trading/telegram-eU3cVP\""
+image_repositories = []
+
+[default.global.parameters]
+region = "ap-south-1"

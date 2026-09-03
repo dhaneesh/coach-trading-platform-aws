@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Coach Trading Platform - serverless migration
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref TradingTable
+        PROFIT_PARAMETER_NAME: /coach-trading/profit-percent
+        TELEGRAM_AUTHORIZED_USER_ID: !Ref TelegramAuthorizedUserId
+        GROWW_SECRET_ARN: !Ref GrowwSecretArn
+        GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
+        TELEGRAM_BOT_TOKEN_SECRET_ARN: !Ref TelegramBotTokenSecretArn
+        TRADING_ENABLED: !Ref TradingEnabled
+
+Parameters:
+  TelegramAuthorizedUserId:
+    Type: String
+
+  GrowwSecretArn:
+    Type: String
+
+  GoogleSecretArn:
+    Type: String
+
+  TelegramBotTokenSecretArn:
+    Type: String
+
+  TradingEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Resources:
+
+  GoogleDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: coach-trading-google-dependencies
+      Description: Google Drive and Sheets dependencies
+      ContentUri: ../layers/google/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+
+  GrowwDependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: coach-trading-groww-dependencies
+      Description: Groww API and TOTP dependencies
+      ContentUri: ../layers/groww/
+      CompatibleRuntimes:
+        - python3.12
+    Metadata:
+      BuildMethod: python3.12
+
+
+  TradingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: coach-trading
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+
+
+  MonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: monitor.handler.lambda_handler
+      Layers:
+        - !Ref GoogleDependenciesLayer
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TradingTable
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Ref GoogleSecretArn
+              - !Ref TelegramBotTokenSecretArn
+
+      Events:
+        MonitorSchedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(*/15 9-15 ? * MON-FRI *)
+            ScheduleExpressionTimezone: Asia/Kolkata
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+
+  SummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: monitor.handler.lambda_summary
+
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref TradingTable
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref TelegramBotTokenSecretArn
+
+      Events:
+        SummarySchedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(35 15 ? * MON-FRI *)
+            ScheduleExpressionTimezone: Asia/Kolkata
+            FlexibleTimeWindow:
+              Mode: "OFF"
+
+
+  TelegramFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Handler: telegram.handler.lambda_handler
+
+      Environment:
+        Variables:
+          TRADING_FUNCTION_NAME: !Ref TradingFunction
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TradingTable
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref TelegramBotTokenSecretArn
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt TradingFunction.Arn
+
+      Events:
+        TelegramWebhook:
+          Type: HttpApi
+          Properties:
+            Path: /telegram/webhook
+            Method: POST
+
+
+  TradingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../src/
+      Runtime: python3.12
+      Handler: trading.executor.lambda_handler
+
+      Layers:
+        - !Ref GrowwDependenciesLayer
+
+      Timeout: 60
+
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TradingTable
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+            Resource: !Ref GrowwSecretArn
+
+        - Statement:
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+
+
+Outputs:
+
+  ApiEndpoint:
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+  TableName:
+    Value: !Ref TradingTable

@@ -1,0 +1,22 @@
+.aws-sam/
+.aws/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.DS_Store
+.secrets/
+# Local secrets
+.secrets/
+
+# Temporary local tests
+tmp/
