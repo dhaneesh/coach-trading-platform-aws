@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import secrets
+import time as time_module
 from datetime import datetime, time
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -18,6 +19,22 @@ TZ = ZoneInfo("Asia/Kolkata")
 
 DEFAULT_MAX_ORDER_VALUE = 25000
 DEFAULT_MAX_ORDER_QUANTITY = 100
+DEFAULT_RECOVERY_RETRIES = 3
+DEFAULT_RECOVERY_DELAY_SECONDS = 1.0
+
+TERMINAL_BUY_FAILURES = {
+    "REJECTED",
+    "CANCELLED",
+    "FAILED",
+    "EXPIRED",
+}
+
+TERMINAL_GTT_FAILURES = {
+    "CANCELLED",
+    "FAILED",
+    "REJECTED",
+    "EXPIRED",
+}
 
 
 def calculate_target(entry_price, profit_percent):
@@ -49,6 +66,19 @@ def extract_value(data, *keys):
     return None
 
 
+def json_safe(value):
+    if isinstance(value, Decimal):
+        return float(value)
+
+    if isinstance(value, dict):
+        return {k: json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [json_safe(v) for v in value]
+
+    return value
+
+
 def validate_instrument(instrument, symbol):
     if not instrument:
         raise ValueError(
@@ -74,6 +104,7 @@ def validate_instrument(instrument, symbol):
 
     if buy_allowed is not None:
         allowed = str(buy_allowed).strip().lower()
+
         if allowed not in {"1", "true", "yes"}:
             raise ValueError(
                 f"BUY is not allowed for {symbol}"
@@ -102,7 +133,134 @@ def validate_quantity(quantity):
         )
 
 
-def execute_buy(*, telegram_user_id, request):
+def get_order_status(order_detail):
+    return str(
+        extract_value(
+            order_detail,
+            "order_status",
+            "orderStatus",
+            "status",
+        )
+        or ""
+    ).upper()
+
+
+def get_gtt_status(smart_order_detail):
+    return str(
+        extract_value(
+            smart_order_detail,
+            "status",
+            "order_status",
+            "orderStatus",
+        )
+        or ""
+    ).upper()
+
+
+def decimal_value(value):
+    return Decimal(str(value))
+
+
+def mark_state(
+    *,
+    user_id,
+    expected_status,
+    new_status,
+    extra=None,
+):
+    extra = extra or {}
+
+    names = {"#s": "status"}
+    values = {
+        ":expected": expected_status,
+        ":new": new_status,
+    }
+
+    assignments = [
+        "#s = :new",
+    ]
+
+    for index, (key, value) in enumerate(extra.items()):
+        name = f"#f{index}"
+        val = f":v{index}"
+
+        names[name] = key
+
+        if isinstance(value, float):
+            value = decimal_value(value)
+
+        values[val] = value
+        assignments.append(f"{name} = {val}")
+
+    table().update_item(
+        Key={
+            "PK": f"USER#{user_id}",
+            "SK": "PENDING_BUY",
+        },
+        UpdateExpression="SET " + ", ".join(assignments),
+        ConditionExpression="#s = :expected",
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+
+
+def safe_mark_state(
+    *,
+    user_id,
+    expected_status,
+    new_status,
+    extra=None,
+):
+    try:
+        mark_state(
+            user_id=user_id,
+            expected_status=expected_status,
+            new_status=new_status,
+            extra=extra,
+        )
+        return True
+
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == (
+            "ConditionalCheckFailedException"
+        ):
+            return False
+
+        raise
+
+
+def load_request(user_id):
+    response = table().get_item(
+        Key={
+            "PK": f"USER#{user_id}",
+            "SK": "PENDING_BUY",
+        }
+    )
+
+    return response.get("Item")
+
+
+def dry_run_execution(*, symbol, quantity, entry_label, entry_price,
+                       profit_percent, target_price, groww_symbol,
+                       ltp, estimated_order_value, market_open):
+    return {
+        "status": "DRY_RUN",
+        "symbol": symbol,
+        "groww_symbol": groww_symbol,
+        "quantity": quantity,
+        "entry": entry_label,
+        "coach_entry_price": entry_price,
+        "profit_percent": profit_percent,
+        "gtt_target_price": target_price,
+        "current_ltp": ltp,
+        "estimated_order_value": estimated_order_value,
+        "market_open": market_open,
+        "order_placed": False,
+        "gtt_created": False,
+    }
+
+
+def execute_new_buy(*, user_id, request):
     quantity = int(request["quantity"])
     validate_quantity(quantity)
 
@@ -150,21 +308,16 @@ def execute_buy(*, telegram_user_id, request):
 
     groww = GrowwClient(groww_credentials)
 
-    # --------------------------------------------------------------
-    # Validate the instrument before any possible order submission.
-    # --------------------------------------------------------------
-
     instrument = groww.get_instrument(symbol)
+
     groww_symbol = validate_instrument(
         instrument,
         symbol,
     )
 
-    # --------------------------------------------------------------
-    # Read-only market-price validation.
-    # --------------------------------------------------------------
-
-    ltp = float(groww.get_ltp(symbol))
+    ltp = float(
+        groww.get_ltp(symbol)
+    )
 
     if ltp <= 0:
         raise ValueError(
@@ -190,30 +343,22 @@ def execute_buy(*, telegram_user_id, request):
         == "true"
     )
 
-    # --------------------------------------------------------------
-    # HARD SAFETY GATE
-    # --------------------------------------------------------------
-
     if not trading_enabled:
-        return {
-            "status": "DRY_RUN",
-            "symbol": symbol,
-            "groww_symbol": groww_symbol,
-            "quantity": quantity,
-            "entry": entry_label,
-            "coach_entry_price": entry_price,
-            "profit_percent": profit_percent,
-            "gtt_target_price": target_price,
-            "current_ltp": ltp,
-            "estimated_order_value": estimated_order_value,
-            "market_open": market_open,
-            "order_placed": False,
-            "gtt_created": False,
-        }
-
-    # --------------------------------------------------------------
-    # REAL TRADING STARTS HERE
-    # --------------------------------------------------------------
+        return (
+            groww,
+            dry_run_execution(
+                symbol=symbol,
+                quantity=quantity,
+                entry_label=entry_label,
+                entry_price=entry_price,
+                profit_percent=profit_percent,
+                target_price=target_price,
+                groww_symbol=groww_symbol,
+                ltp=ltp,
+                estimated_order_value=estimated_order_value,
+                market_open=market_open,
+            ),
+        )
 
     if not market_open:
         raise ValueError(
@@ -221,11 +366,7 @@ def execute_buy(*, telegram_user_id, request):
         )
 
     # --------------------------------------------------------------
-    # Fresh CNC funds check immediately before the real BUY.
-    #
-    # We check both:
-    #   1. currently available CNC balance
-    #   2. exact Groww margin requirement for this order
+    # Fresh funds check immediately before the BUY state claim.
     # --------------------------------------------------------------
 
     funds = groww.check_cnc_funds(
@@ -236,7 +377,8 @@ def execute_buy(*, telegram_user_id, request):
     )
 
     logger.info(
-        "BUY funds check: symbol=%s quantity=%s available=%s required=%s sufficient=%s",
+        "BUY funds check: symbol=%s quantity=%s "
+        "available=%s required=%s sufficient=%s",
         symbol,
         quantity,
         funds["cnc_balance_available"],
@@ -245,13 +387,58 @@ def execute_buy(*, telegram_user_id, request):
     )
 
     if not funds["sufficient"]:
-        raise ValueError(
-            f"Insufficient CNC funds for {symbol}. "
-            f"Available ₹{funds['cnc_balance_available']:.2f}; "
-            f"required ₹{funds['total_requirement']:.2f}"
+        safe_mark_state(
+            user_id=user_id,
+            expected_status="CONFIRMED_BUT_NOT_EXECUTED",
+            new_status="INSUFFICIENT_FUNDS",
+            extra={
+                "fundsAvailable": funds["cnc_balance_available"],
+                "fundsRequired": funds["total_requirement"],
+                "executionError": (
+                    f"Insufficient CNC funds. "
+                    f"Available ₹{funds['cnc_balance_available']:.2f}; "
+                    f"required ₹{funds['total_requirement']:.2f}"
+                ),
+                "executionAt": datetime.now(TZ).isoformat(),
+            },
         )
 
+        return None, {
+            "status": "INSUFFICIENT_FUNDS",
+            "symbol": symbol,
+            "quantity": quantity,
+            "funds_available": funds["cnc_balance_available"],
+            "funds_required": funds["total_requirement"],
+            "order_placed": False,
+            "gtt_created": False,
+        }
+
+    # --------------------------------------------------------------
+    # Generate and persist reference BEFORE calling Groww.
+    # --------------------------------------------------------------
+
     order_reference_id = make_order_reference("OC")
+
+    claimed = safe_mark_state(
+        user_id=user_id,
+        expected_status="CONFIRMED_BUT_NOT_EXECUTED",
+        new_status="BUY_SUBMITTING",
+        extra={
+            "buyOrderReference": order_reference_id,
+            "buySubmittingAt": datetime.now(TZ).isoformat(),
+            "currentLtp": ltp,
+            "gttTargetPrice": target_price,
+            "estimatedOrderValue": estimated_order_value,
+            "fundsAvailable": funds["cnc_balance_available"],
+            "fundsRequired": funds["total_requirement"],
+        },
+    )
+
+    if not claimed:
+        return None, {
+            "status": "ALREADY_PROCESSING",
+            "message": "BUY request is already being processed.",
+        }
 
     logger.info(
         "Placing REAL BUY: symbol=%s quantity=%s reference=%s",
@@ -260,6 +447,10 @@ def execute_buy(*, telegram_user_id, request):
         order_reference_id,
     )
 
+    # IMPORTANT:
+    # If this call succeeds at Groww but Lambda crashes before the
+    # following DynamoDB update, the persisted reference lets the
+    # next invocation recover the BUY without submitting another one.
     buy_response = groww.place_market_buy(
         trading_symbol=symbol,
         quantity=quantity,
@@ -275,180 +466,795 @@ def execute_buy(*, telegram_user_id, request):
     )
 
     if not groww_order_id:
-        raise RuntimeError(
-            f"Groww BUY response did not contain an order ID: "
-            f"{buy_response}"
+        safe_mark_state(
+            user_id=user_id,
+            expected_status="BUY_SUBMITTING",
+            new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            extra={
+                "executionError": (
+                    "Groww accepted the BUY call but no order ID "
+                    "was returned. Manual review required."
+                ),
+                "executionAt": datetime.now(TZ).isoformat(),
+                "buyResponse": json_safe(buy_response),
+            },
         )
 
-    # --------------------------------------------------------------
-    # Verify BUY execution.
-    # --------------------------------------------------------------
-
-    order_detail = groww.get_order_detail(
-        groww_order_id
-    )
-
-    buy_status = str(
-        extract_value(
-            order_detail,
-            "order_status",
-            "orderStatus",
-            "status",
-        )
-        or ""
-    ).upper()
-
-    average_fill_price = extract_value(
-        order_detail,
-        "average_fill_price",
-        "averageFillPrice",
-        "avg_fill_price",
-        "avgFillPrice",
-    )
-
-    logger.info(
-        "BUY result: order_id=%s status=%s average_fill_price=%s",
-        groww_order_id,
-        buy_status,
-        average_fill_price,
-    )
-
-    if buy_status != "EXECUTED":
-        return {
-            "status": "BUY_REJECTED",
+        return None, {
+            "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
             "symbol": symbol,
             "quantity": quantity,
-            "buy_order_id": groww_order_id,
-            "buy_order_reference": order_reference_id,
-            "buy_status": buy_status,
-            "order_placed": True,
-            "gtt_created": False,
-        }
-
-    if average_fill_price is None:
-        raise RuntimeError(
-            "BUY was executed but average fill price was not returned"
-        )
-
-    average_fill_price = float(average_fill_price)
-
-    # --------------------------------------------------------------
-    # Create SELL GTT at coach entry + configured profit.
-    # --------------------------------------------------------------
-
-    gtt_reference_id = make_order_reference("GTT")
-
-    logger.info(
-        "Creating SELL GTT: symbol=%s quantity=%s target=%s reference=%s",
-        symbol,
-        quantity,
-        target_price,
-        gtt_reference_id,
-    )
-
-    gtt_response = groww.create_sell_gtt(
-        trading_symbol=symbol,
-        quantity=quantity,
-        trigger_price=target_price,
-        reference_id=gtt_reference_id,
-    )
-
-    smart_order_id = extract_value(
-        gtt_response,
-        "smart_order_id",
-        "smartOrderId",
-        "smart_order_internal_id",
-        "smartOrderInternalId",
-    )
-
-    if not smart_order_id:
-        raise RuntimeError(
-            f"Groww GTT response did not contain a smart order ID: "
-            f"{gtt_response}"
-        )
-
-    # --------------------------------------------------------------
-    # Verify GTT is active.
-    # --------------------------------------------------------------
-
-    smart_order_detail = groww.get_smart_order(
-        smart_order_id
-    )
-
-    gtt_status = str(
-        extract_value(
-            smart_order_detail,
-            "status",
-            "order_status",
-            "orderStatus",
-        )
-        or ""
-    ).upper()
-
-    logger.info(
-        "GTT result: smart_order_id=%s status=%s",
-        smart_order_id,
-        gtt_status,
-    )
-
-    if gtt_status != "ACTIVE":
-        return {
-            "status": "BUY_PLACED_GTT_FAILED",
-            "symbol": symbol,
-            "quantity": quantity,
-            "buy_order_id": groww_order_id,
-            "buy_order_reference": order_reference_id,
-            "buy_status": buy_status,
-            "buy_average_price": average_fill_price,
-            "gtt_id": smart_order_id,
-            "gtt_reference": gtt_reference_id,
-            "gtt_status": gtt_status,
-            "gtt_target_price": target_price,
-            "order_placed": True,
-            "gtt_created": True,
             "message": (
-                "BUY was executed, but the SELL GTT was not confirmed "
-                "ACTIVE. Manual GTT action is required."
+                "BUY execution could not be confirmed safely. "
+                "Manual review is required. No automatic retry "
+                "will submit another BUY."
             ),
         }
 
+    mark_state(
+        user_id=user_id,
+        expected_status="BUY_SUBMITTING",
+        new_status="BUY_SUBMITTED",
+        extra={
+            "buyOrderId": groww_order_id,
+            "buySubmittedAt": datetime.now(TZ).isoformat(),
+        },
+    )
+
+    request = load_request(user_id)
+
+    return continue_buy_and_gtt(
+        user_id=user_id,
+        request=request,
+        groww=groww,
+    )
+
+
+def recover_buy_submission(*, user_id, request, groww):
+    reference = request.get("buyOrderReference")
+
+    if not reference:
+        safe_mark_state(
+            user_id=user_id,
+            expected_status="BUY_SUBMITTING",
+            new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            extra={
+                "executionError": (
+                    "BUY_SUBMITTING state has no order reference."
+                ),
+                "executionAt": datetime.now(TZ).isoformat(),
+            },
+        )
+
+        return {
+            "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            "message": (
+                "BUY execution state is incomplete. "
+                "Manual review is required."
+            ),
+        }
+
+    logger.info(
+        "Recovering BUY by reference: %s",
+        reference,
+    )
+
+    # Groww's documented response contains groww_order_id, order_status,
+    # filled_quantity and order_reference_id. We persist the response
+    # fields we need so a Lambda crash/retry never causes another BUY.
+    retries = int(os.environ.get("BUY_RECOVERY_RETRIES", str(DEFAULT_RECOVERY_RETRIES)))
+    delay_seconds = float(os.environ.get("BUY_RECOVERY_DELAY_SECONDS", str(DEFAULT_RECOVERY_DELAY_SECONDS)))
+
+    response = None
+    groww_order_id = None
+    for attempt in range(1, retries + 1):
+        response = groww.get_order_status_by_reference(reference)
+        groww_order_id = extract_value(
+            response,
+            "groww_order_id",
+            "growwOrderId",
+            "order_id",
+            "orderId",
+        )
+
+        if groww_order_id:
+            break
+
+        logger.warning(
+            "BUY reference lookup returned no order ID: reference=%s attempt=%s/%s response=%s",
+            reference,
+            attempt,
+            retries,
+            json_safe(response),
+        )
+
+        if attempt < retries:
+            time_module.sleep(delay_seconds)
+
+    if not groww_order_id:
+        safe_mark_state(
+            user_id=user_id,
+            expected_status="BUY_SUBMITTING",
+            new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            extra={
+                "executionError": (
+                    "BUY reference could not be resolved to a Groww "
+                    "order ID after recovery attempts. Automatic "
+                    "re-submission is blocked."
+                ),
+                "executionAt": datetime.now(TZ).isoformat(),
+                "buyRecoveryResponse": json_safe(response),
+            },
+        )
+
+        return {
+            "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            "message": (
+                "Unable to safely determine whether the BUY was "
+                "submitted. Manual review is required. "
+                "No automatic retry will submit another BUY."
+            ),
+        }
+
+    reference_status = str(
+        extract_value(
+            response,
+            "order_status",
+            "orderStatus",
+            "status",
+        )
+        or ""
+    ).upper()
+
+    filled_quantity = extract_value(
+        response,
+        "filled_quantity",
+        "filledQuantity",
+    )
+
+    claimed = safe_mark_state(
+        user_id=user_id,
+        expected_status="BUY_SUBMITTING",
+        new_status="BUY_SUBMITTED",
+        extra={
+            "buyOrderId": groww_order_id,
+            "buyStatus": reference_status,
+            "buyFilledQuantity": filled_quantity,
+            "buyRecoveredAt": datetime.now(TZ).isoformat(),
+            "buyRecoveryResponse": json_safe(response),
+        },
+    )
+
+    if not claimed:
+        current = load_request(user_id)
+        if current:
+            return continue_buy_and_gtt(
+                user_id=user_id,
+                request=current,
+                groww=groww,
+            )
+
+    request = load_request(user_id)
+    if not request:
+        return {
+            "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+            "message": (
+                "BUY order was recovered, but the execution state "
+                "could not be reloaded safely. Manual review required."
+            ),
+        }
+
+    return continue_buy_and_gtt(
+        user_id=user_id,
+        request=request,
+        groww=groww,
+    )
+
+
+def find_gtt_with_retries(groww, reference):
+    retries = int(os.environ.get("GTT_RECOVERY_RETRIES", str(DEFAULT_RECOVERY_RETRIES)))
+    delay_seconds = float(os.environ.get("GTT_RECOVERY_DELAY_SECONDS", str(DEFAULT_RECOVERY_DELAY_SECONDS)))
+
+    for attempt in range(1, retries + 1):
+        existing_gtt = groww.find_gtt_by_reference(reference)
+        if existing_gtt:
+            return existing_gtt
+
+        logger.info(
+            "GTT reference not visible yet: reference=%s attempt=%s/%s",
+            reference,
+            attempt,
+            retries,
+        )
+
+        if attempt < retries:
+            time_module.sleep(delay_seconds)
+
+    return None
+
+
+def continue_buy_and_gtt(*, user_id, request, groww):
+    status = request.get("status")
+
+    if status == "BUY_SUBMITTED":
+        groww_order_id = request.get("buyOrderId")
+
+        if not groww_order_id:
+            safe_mark_state(
+                user_id=user_id,
+                expected_status="BUY_SUBMITTED",
+                new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
+                extra={
+                    "executionError": (
+                        "BUY_SUBMITTED state has no Groww order ID."
+                    ),
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+                "message": (
+                    "BUY state is incomplete. Manual review required."
+                ),
+            }
+
+        order_detail = groww.get_order_detail(
+            groww_order_id
+        )
+
+        buy_status = get_order_status(order_detail)
+
+        average_fill_price = extract_value(
+            order_detail,
+            "average_fill_price",
+            "averageFillPrice",
+            "avg_fill_price",
+            "avgFillPrice",
+        )
+
+        logger.info(
+            "BUY result: order_id=%s status=%s average_fill_price=%s",
+            groww_order_id,
+            buy_status,
+            average_fill_price,
+        )
+
+        if buy_status == "EXECUTED":
+            if average_fill_price is None:
+                safe_mark_state(
+                    user_id=user_id,
+                    expected_status="BUY_SUBMITTED",
+                    new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
+                    extra={
+                        "buyStatus": buy_status,
+                        "executionError": (
+                            "BUY is EXECUTED but average fill price "
+                            "was not returned."
+                        ),
+                        "executionAt": datetime.now(TZ).isoformat(),
+                    },
+                )
+
+                return {
+                    "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+                    "message": (
+                        "BUY was executed but its fill price could "
+                        "not be confirmed. Manual review required."
+                    ),
+                }
+
+            average_fill_price = float(average_fill_price)
+
+            mark_state(
+                user_id=user_id,
+                expected_status="BUY_SUBMITTED",
+                new_status="BUY_EXECUTED",
+                extra={
+                    "buyStatus": buy_status,
+                    "buyAveragePrice": average_fill_price,
+                    "buyExecutedAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            request = load_request(user_id)
+
+        elif buy_status in TERMINAL_BUY_FAILURES:
+            mark_state(
+                user_id=user_id,
+                expected_status="BUY_SUBMITTED",
+                new_status="BUY_REJECTED",
+                extra={
+                    "buyStatus": buy_status,
+                    "orderPlaced": True,
+                    "gttCreated": False,
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "BUY_REJECTED",
+                "symbol": request["symbol"],
+                "quantity": request["quantity"],
+                "buy_status": buy_status,
+                "order_placed": True,
+                "gtt_created": False,
+            }
+
+        else:
+            return {
+                "status": "BUY_PENDING",
+                "symbol": request["symbol"],
+                "quantity": request["quantity"],
+                "buy_status": buy_status,
+                "message": (
+                    "BUY has been submitted and is not yet in a "
+                    "terminal state. No second BUY will be submitted."
+                ),
+            }
+
+    # --------------------------------------------------------------
+    # BUY_EXECUTED -> create/recover GTT.
+    # --------------------------------------------------------------
+
+    if request.get("status") == "BUY_EXECUTED":
+        gtt_reference = request.get("gttReference")
+
+        if not gtt_reference:
+            gtt_reference = make_order_reference("GTT")
+
+            claimed = safe_mark_state(
+                user_id=user_id,
+                expected_status="BUY_EXECUTED",
+                new_status="GTT_SUBMITTING",
+                extra={
+                    "gttReference": gtt_reference,
+                    "gttSubmittingAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            if not claimed:
+                request = load_request(user_id)
+
+        else:
+            safe_mark_state(
+                user_id=user_id,
+                expected_status="BUY_EXECUTED",
+                new_status="GTT_SUBMITTING",
+                extra={
+                    "gttSubmittingAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+        request = load_request(user_id)
+
+    if request.get("status") == "GTT_SUBMITTING":
+        gtt_reference = request.get("gttReference")
+
+        existing_gtt = find_gtt_with_retries(
+            groww,
+            gtt_reference,
+        )
+
+        if existing_gtt:
+            smart_order_id = extract_value(
+                existing_gtt,
+                "smart_order_id",
+                "smartOrderId",
+                "smart_order_internal_id",
+                "smartOrderInternalId",
+                "id",
+            )
+
+            if smart_order_id:
+                mark_state(
+                    user_id=user_id,
+                    expected_status="GTT_SUBMITTING",
+                    new_status="GTT_SUBMITTED",
+                    extra={
+                        "gttId": smart_order_id,
+                        "gttRecoveredAt": datetime.now(TZ).isoformat(),
+                    },
+                )
+
+                request = load_request(user_id)
+            else:
+                safe_mark_state(
+                    user_id=user_id,
+                    expected_status="GTT_SUBMITTING",
+                    new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    extra={
+                        "executionError": (
+                            "Existing GTT reference was found but "
+                            "its internal ID could not be resolved."
+                        ),
+                        "executionAt": datetime.now(TZ).isoformat(),
+                    },
+                )
+
+                return {
+                    "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    "message": (
+                        "BUY exists, but the GTT could not be safely "
+                        "resolved. Manual action is required."
+                    ),
+                }
+
+        else:
+            target_price = float(
+                request["gttTargetPrice"]
+            )
+
+            logger.info(
+                "Creating SELL GTT: symbol=%s quantity=%s "
+                "target=%s reference=%s",
+                request["symbol"],
+                request["quantity"],
+                target_price,
+                gtt_reference,
+            )
+
+            try:
+                gtt_response = groww.create_sell_gtt(
+                    trading_symbol=request["symbol"],
+                    quantity=int(request["quantity"]),
+                    trigger_price=target_price,
+                    reference_id=gtt_reference,
+                )
+            except Exception:
+                # The API call may have succeeded remotely before the
+                # client observed an exception (for example, timeout).
+                # Therefore we MUST NOT automatically call create_sell_gtt
+                # again. Move to manual review and retain the same
+                # reference so the GTT can be checked safely later.
+                logger.exception(
+                    "GTT create call failed; blocking automatic retry: reference=%s",
+                    gtt_reference,
+                )
+                safe_mark_state(
+                    user_id=user_id,
+                    expected_status="GTT_SUBMITTING",
+                    new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    extra={
+                        "executionError": (
+                            "SELL GTT submission could not be confirmed. "
+                            "Automatic duplicate GTT creation is blocked. "
+                            "Manual review is required."
+                        ),
+                        "executionAt": datetime.now(TZ).isoformat(),
+                        "gttCreateException": True,
+                    },
+                )
+                return {
+                    "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    "symbol": request["symbol"],
+                    "quantity": request["quantity"],
+                    "message": (
+                        "BUY was executed, but SELL GTT submission "
+                        "could not be confirmed. Automatic duplicate "
+                        "GTT creation is blocked. Manual review is required."
+                    ),
+                }
+
+            smart_order_id = extract_value(
+                gtt_response,
+                "smart_order_id",
+                "smartOrderId",
+                "smart_order_internal_id",
+                "smartOrderInternalId",
+                "id",
+            )
+
+            if not smart_order_id:
+                recovered_gtt = find_gtt_with_retries(
+                    groww,
+                    gtt_reference,
+                )
+                smart_order_id = extract_value(
+                    recovered_gtt,
+                    "smart_order_id",
+                    "smartOrderId",
+                    "smart_order_internal_id",
+                    "smartOrderInternalId",
+                    "id",
+                )
+
+            if not smart_order_id:
+                safe_mark_state(
+                    user_id=user_id,
+                    expected_status="GTT_SUBMITTING",
+                    new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    extra={
+                        "executionError": (
+                            "Groww GTT response did not expose a smart-order "
+                            "ID and the saved reference could not be resolved. "
+                            "Automatic duplicate GTT creation is blocked."
+                        ),
+                        "executionAt": datetime.now(TZ).isoformat(),
+                        "gttResponse": json_safe(gtt_response),
+                    },
+                )
+
+                return {
+                    "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                    "message": (
+                        "BUY was executed, but the SELL GTT could not be "
+                        "confirmed safely. Manual action is required."
+                    ),
+                }
+
+            mark_state(
+                user_id=user_id,
+                expected_status="GTT_SUBMITTING",
+                new_status="GTT_SUBMITTED",
+                extra={
+                    "gttId": smart_order_id,
+                    "gttSubmittedAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            request = load_request(user_id)
+
+    # --------------------------------------------------------------
+    # GTT_SUBMITTED -> verify ACTIVE.
+    # --------------------------------------------------------------
+
+    if request.get("status") == "GTT_SUBMITTED":
+        smart_order_id = request.get("gttId")
+
+        if not smart_order_id:
+            safe_mark_state(
+                user_id=user_id,
+                expected_status="GTT_SUBMITTED",
+                new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                extra={
+                    "executionError": (
+                        "GTT_SUBMITTED state has no smart-order ID."
+                    ),
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                "message": (
+                    "GTT state is incomplete. Manual action required."
+                ),
+            }
+
+        smart_order_detail = groww.get_smart_order(
+            smart_order_id
+        )
+
+        gtt_status = get_gtt_status(
+            smart_order_detail
+        )
+
+        logger.info(
+            "GTT result: id=%s status=%s",
+            smart_order_id,
+            gtt_status,
+        )
+
+        if gtt_status == "ACTIVE":
+            mark_state(
+                user_id=user_id,
+                expected_status="GTT_SUBMITTED",
+                new_status="ORDER_PLACED",
+                extra={
+                    "buyStatus": "EXECUTED",
+                    "orderPlaced": True,
+                    "gttCreated": True,
+                    "gttStatus": gtt_status,
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            request = load_request(user_id)
+
+        elif gtt_status in TERMINAL_GTT_FAILURES:
+            mark_state(
+                user_id=user_id,
+                expected_status="GTT_SUBMITTED",
+                new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                extra={
+                    "gttStatus": gtt_status,
+                    "orderPlaced": True,
+                    "gttCreated": True,
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+                "symbol": request["symbol"],
+                "quantity": request["quantity"],
+                "buy_average_price": request.get(
+                    "buyAveragePrice"
+                ),
+                "gtt_status": gtt_status,
+                "message": (
+                    "BUY was executed, but the SELL GTT is not "
+                    "ACTIVE. Manual GTT action is required."
+                ),
+            }
+
+        else:
+            return {
+                "status": "GTT_PENDING",
+                "symbol": request["symbol"],
+                "quantity": request["quantity"],
+                "gtt_status": gtt_status,
+                "message": (
+                    "SELL GTT has been submitted but is not yet "
+                    "confirmed ACTIVE. No second GTT will be created."
+                ),
+            }
+
+    if request.get("status") == "ORDER_PLACED":
+        return {
+            "status": "ORDER_PLACED",
+            "symbol": request["symbol"],
+            "quantity": int(request["quantity"]),
+            "coach_entry_price": float(
+                request["coachEntryPrice"]
+            ),
+            "profit_percent": float(
+                get_parameter(
+                    os.environ.get(
+                        "PROFIT_PARAMETER_NAME",
+                        "/coach-trading/profit-percent",
+                    )
+                )
+            ),
+            "gtt_target_price": float(
+                request["gttTargetPrice"]
+            ),
+            "buy_order_id": request.get(
+                "buyOrderId"
+            ),
+            "buy_average_price": request.get(
+                "buyAveragePrice"
+            ),
+            "gtt_id": request.get(
+                "gttId"
+            ),
+            "gtt_status": request.get(
+                "gttStatus"
+            ),
+            "order_placed": True,
+            "gtt_created": True,
+        }
+
     return {
-        "status": "ORDER_PLACED",
-        "symbol": symbol,
-        "groww_symbol": groww_symbol,
-        "quantity": quantity,
-        "entry": entry_label,
-        "coach_entry_price": entry_price,
-        "profit_percent": profit_percent,
-        "gtt_target_price": target_price,
-        "current_ltp": ltp,
-        "estimated_order_value": estimated_order_value,
-        "buy_order_id": groww_order_id,
-        "buy_order_reference": order_reference_id,
-        "buy_status": buy_status,
-        "buy_average_price": average_fill_price,
-        "gtt_id": smart_order_id,
-        "gtt_reference": gtt_reference_id,
-        "gtt_status": gtt_status,
-        "order_placed": True,
-        "gtt_created": True,
+        "status": request.get("status"),
+        "symbol": request.get("symbol"),
+        "quantity": request.get("quantity"),
+        "message": "Execution state requires no additional action.",
+    }
+
+
+def execute_request(*, user_id, request):
+    status = request.get("status")
+
+    groww_credentials = get_secret(
+        os.environ["GROWW_SECRET_ARN"]
+    )
+
+    groww = GrowwClient(groww_credentials)
+
+    if status == "CONFIRMED_BUT_NOT_EXECUTED":
+        groww, result = execute_new_buy(
+            user_id=user_id,
+            request=request,
+        )
+
+        if result["status"] == "DRY_RUN":
+            return result
+
+        if result["status"] in {
+            "INSUFFICIENT_FUNDS",
+            "ALREADY_PROCESSING",
+        }:
+            return result
+
+        current = load_request(user_id)
+
+        if not current:
+            return {
+                "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+                "message": (
+                    "Execution request disappeared from state."
+                ),
+            }
+
+        return continue_buy_and_gtt(
+            user_id=user_id,
+            request=current,
+            groww=groww,
+        )
+
+    if status == "BUY_SUBMITTING":
+        recovered = recover_buy_submission(
+            user_id=user_id,
+            request=request,
+            groww=groww,
+        )
+
+        if isinstance(recovered, tuple):
+            return recovered[1]
+
+        return recovered
+    
+    if status in {
+        "BUY_SUBMITTED",
+        "BUY_EXECUTED",
+        "GTT_SUBMITTING",
+        "GTT_SUBMITTED",
+    }:
+        return continue_buy_and_gtt(
+            user_id=user_id,
+            request=request,
+            groww=groww,
+        )
+
+    if status == "ORDER_PLACED":
+        return {
+            "status": "ALREADY_PROCESSED",
+            "symbol": request["symbol"],
+            "quantity": request["quantity"],
+            "message": "BUY request has already been completed.",
+        }
+
+    if status in {
+        "BUY_REJECTED",
+        "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+        "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+        "INSUFFICIENT_FUNDS",
+        "VALIDATION_FAILED",
+    }:
+        return {
+            "status": status,
+            "symbol": request.get("symbol"),
+            "quantity": request.get("quantity"),
+            "message": request.get(
+                "executionError",
+                "This BUY request is in a terminal state.",
+            ),
+        }
+
+    if status == "DRY_RUN_EXECUTED":
+        return {
+            "status": "ALREADY_PROCESSED",
+            "symbol": request["symbol"],
+            "quantity": request["quantity"],
+            "message": "BUY request has already been processed.",
+        }
+
+    return {
+        "status": "INVALID_STATE",
+        "message": (
+            f"Unsupported BUY execution state: {status}"
+        ),
     }
 
 
 def lambda_handler(event, context):
+    user_id = str(
+        event.get("telegram_user_id", "")
+    )
+
+    if not user_id:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "status": "validation_error",
+                "message": "telegram_user_id is required",
+            }),
+        }
+
     try:
-        user_id = str(
-            event["telegram_user_id"]
-        )
-
-        result = table().get_item(
-            Key={
-                "PK": f"USER#{user_id}",
-                "SK": "PENDING_BUY",
-            }
-        )
-
-        request = result.get("Item")
+        request = load_request(user_id)
 
         if not request:
             return {
@@ -459,161 +1265,122 @@ def lambda_handler(event, context):
                 }),
             }
 
-        if request.get("status") != "CONFIRMED_BUT_NOT_EXECUTED":
+        status = request.get("status")
+
+        if status == "PENDING_CONFIRMATION":
             return {
                 "statusCode": 409,
                 "body": json.dumps({
                     "status": "error",
-                    "message": "BUY request is not ready for execution",
-                    "currentStatus": request.get("status"),
+                    "message": "BUY request has not been confirmed",
                 }),
             }
 
-        # ----------------------------------------------------------
-        # Safety: requests created by the current Telegram flow
-        # must still explicitly be marked as dry-run.
-        # ----------------------------------------------------------
-
-        if request.get("dryRun") is not True:
-            return {
-                "statusCode": 409,
-                "body": json.dumps({
-                    "status": "error",
-                    "message": (
-                        "Trading executor received a non-dry-run request"
-                    ),
-                }),
-            }
-
-        result = execute_buy(
-            telegram_user_id=user_id,
+        result = execute_request(
+            user_id=user_id,
             request=request,
         )
 
-        timestamp = datetime.now(TZ).isoformat()
+        status = result.get("status")
 
-        # ----------------------------------------------------------
-        # Persist dry-run result.
-        #
-        # Real execution persistence will be added once we have
-        # completed the read-only validation of the Groww response
-        # fields against the live account.
-        # ----------------------------------------------------------
-
-        if result["status"] == "DRY_RUN":
-            table().update_item(
-                Key={
-                    "PK": f"USER#{user_id}",
-                    "SK": "PENDING_BUY",
-                },
-                UpdateExpression=(
-                    "SET #s = :executed, executionAt = :t, "
-                    "executionStatus = :es, orderPlaced = :op, "
-                    "gttCreated = :gc, gttTargetPrice = :target, "
-                    "currentLtp = :ltp, marketOpen = :mo"
-                ),
-                ConditionExpression=(
-                    "#s = :confirmed AND dryRun = :dry"
-                ),
-                ExpressionAttributeNames={
-                    "#s": "status",
-                },
-                ExpressionAttributeValues={
-                    ":confirmed": "CONFIRMED_BUT_NOT_EXECUTED",
-                    ":executed": "DRY_RUN_EXECUTED",
-                    ":t": timestamp,
-                    ":es": "DRY_RUN",
-                    ":op": False,
-                    ":gc": False,
-                    ":target": Decimal(
-                        str(result["gtt_target_price"])
+        if status == "DRY_RUN":
+            mark_state(
+                user_id=user_id,
+                expected_status="CONFIRMED_BUT_NOT_EXECUTED",
+                new_status="DRY_RUN_EXECUTED",
+                extra={
+                    "executionAt": datetime.now(TZ).isoformat(),
+                    "executionStatus": "DRY_RUN",
+                    "orderPlaced": False,
+                    "gttCreated": False,
+                    "gttTargetPrice": decimal_value(
+                        result["gtt_target_price"]
                     ),
-                    ":ltp": Decimal(
-                        str(result["current_ltp"])
+                    "currentLtp": decimal_value(
+                        result["current_ltp"]
                     ),
-                    ":mo": result["market_open"],
-                    ":dry": True,
+                    "marketOpen": result["market_open"],
                 },
-            )
-
-            logger.info(
-                "Dry-run trading execution completed: %s",
-                result,
             )
 
             return {
                 "statusCode": 200,
-                "body": json.dumps(result),
+                "body": json.dumps(
+                    result,
+                    default=json_safe,
+                ),
             }
 
-        # ----------------------------------------------------------
-        # Real execution persistence.
-        # ----------------------------------------------------------
-
-        table().update_item(
-            Key={
-                "PK": f"USER#{user_id}",
-                "SK": "PENDING_BUY",
-            },
-            UpdateExpression=(
-                "SET #s = :executed, executionAt = :t, "
-                "executionStatus = :es, orderPlaced = :op, "
-                "gttCreated = :gc, gttTargetPrice = :target, "
-                "buyOrderId = :boid, buyOrderReference = :bref, "
-                "buyStatus = :bstatus, buyAveragePrice = :avg, "
-                "gttId = :gid, gttReference = :gref, "
-                "gttStatus = :gstatus"
-            ),
-            ConditionExpression=(
-                "#s = :confirmed AND dryRun = :dry"
-            ),
-            ExpressionAttributeNames={
-                "#s": "status",
-            },
-            ExpressionAttributeValues={
-                ":confirmed": "CONFIRMED_BUT_NOT_EXECUTED",
-                ":executed": result["status"],
-                ":t": timestamp,
-                ":es": result["status"],
-                ":op": result.get("order_placed", False),
-                ":gc": result.get("gtt_created", False),
-                ":target": Decimal(
-                    str(result["gtt_target_price"])
+        if status in {
+            "INSUFFICIENT_FUNDS",
+            "VALIDATION_FAILED",
+            "BUY_REJECTED",
+            "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+            "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+        }:
+            return {
+                "statusCode": 400,
+                "body": json.dumps(
+                    result,
+                    default=json_safe,
                 ),
-                ":boid": result.get("buy_order_id", "N/A"),
-                ":bref": result.get("buy_order_reference", "N/A"),
-                ":bstatus": result.get("buy_status", "N/A"),
-                ":avg": Decimal(
-                    str(result.get("buy_average_price", 0))
-                ),
-                ":gid": result.get("gtt_id", "N/A"),
-                ":gref": result.get("gtt_reference", "N/A"),
-                ":gstatus": result.get("gtt_status", "N/A"),
-                ":dry": True,
-            },
-        )
+            }
 
-        logger.info(
-            "Trading execution completed: %s",
-            result,
-        )
+        if status in {
+            "BUY_PENDING",
+            "GTT_PENDING",
+            "ALREADY_PROCESSING",
+        }:
+            return {
+                "statusCode": 202,
+                "body": json.dumps(
+                    result,
+                    default=json_safe,
+                ),
+            }
+
+        if status == "ORDER_PLACED":
+            return {
+                "statusCode": 200,
+                "body": json.dumps(
+                    result,
+                    default=json_safe,
+                ),
+            }
+
+        if status == "ALREADY_PROCESSED":
+            return {
+                "statusCode": 409,
+                "body": json.dumps(
+                    result,
+                    default=json_safe,
+                ),
+            }
 
         return {
-            "statusCode": 200,
-            "body": json.dumps(result),
+            "statusCode": 409,
+            "body": json.dumps(
+                result,
+                default=json_safe,
+            ),
         }
 
     except ClientError as exc:
-        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+        if exc.response["Error"]["Code"] == (
+            "ConditionalCheckFailedException"
+        ):
             logger.warning(
-                "Trading request was already processed for user %s",
-                event.get("telegram_user_id"),
+                "Execution state changed concurrently for user %s",
+                user_id,
             )
+
             return {
                 "statusCode": 409,
                 "body": json.dumps({
-                    "status": "already_processed",
-                    "message": "BUY request was already processed",
+                    "status": "already_processing",
+                    "message": (
+                        "BUY request is already being processed."
+                    ),
                 }),
             }
 
@@ -633,6 +1400,20 @@ def lambda_handler(event, context):
         logger.warning(
             "Trading validation failed: %s",
             exc,
+        )
+
+        # Don't leave a confirmed request looking executable when
+        # validation itself has failed.
+        safe_mark_state(
+            user_id=user_id,
+            expected_status="CONFIRMED_BUT_NOT_EXECUTED",
+            new_status="VALIDATION_FAILED",
+            extra={
+                "executionError": str(exc),
+                "executionAt": datetime.now(TZ).isoformat(),
+                "orderPlaced": False,
+                "gttCreated": False,
+            },
         )
 
         return {

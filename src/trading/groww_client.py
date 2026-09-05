@@ -194,6 +194,48 @@ class GrowwClient:
             )
         )
 
+    def get_smart_order_list(
+        self,
+        *,
+        status=None,
+        page=0,
+        page_size=50,
+    ):
+        return self.call_with_reauth(
+            lambda: self.client.get_smart_order_list(
+                smart_order_type="GTT",
+                segment=self.client.SEGMENT_CASH,
+                status=status,
+                page=page,
+                page_size=page_size,
+            )
+        )
+
+    def find_gtt_by_reference(self, reference_id):
+        for page in range(10):
+            response = self.get_smart_order_list(
+                page=page,
+                page_size=50,
+            )
+
+            orders = response.get("orders", [])
+
+            for order in orders:
+                candidate = (
+                    order.get("reference_id")
+                    or order.get("referenceId")
+                    or order.get("smart_order_reference_id")
+                    or order.get("smartOrderReferenceId")
+                )
+
+                if candidate == reference_id:
+                    return order
+
+            if len(orders) < 50:
+                break
+
+        return None
+
     def get_available_margin_details(self):
         return self.call_with_reauth(
             lambda: self.client.get_available_margin_details()

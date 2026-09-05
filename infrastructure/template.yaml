@@ -16,7 +16,6 @@ Globals:
         GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
         TELEGRAM_BOT_TOKEN_SECRET_ARN: !Ref TelegramBotTokenSecretArn
         TRADING_ENABLED: !Ref TradingEnabled
-
 Parameters:
   TelegramAuthorizedUserId:
     Type: String
