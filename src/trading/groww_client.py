@@ -1,5 +1,6 @@
 import os
 import pyotp
+import growwapi.groww.client as groww_client_module
 
 from growwapi import GrowwAPI
 from growwapi.groww.exceptions import GrowwAPIException
@@ -7,6 +8,8 @@ from growwapi.groww.exceptions import GrowwAPIException
 
 class GrowwClient:
     def __init__(self, credentials=None):
+        self._configure_instrument_cache()
+
         credentials = credentials or {}
 
         self.totp_token = (
@@ -20,6 +23,17 @@ class GrowwClient:
 
         self.client = None
         self.authenticate()
+
+    @staticmethod
+    def _configure_instrument_cache():
+        cache_dir = "/tmp/groww/common"
+        os.makedirs(cache_dir, exist_ok=True)
+
+        if getattr(groww_client_module, "_coach_original_get_cwd", None) is None:
+            groww_client_module._coach_original_get_cwd = groww_client_module.get_cwd
+            groww_client_module.get_cwd = (
+                lambda file=__file__: cache_dir
+            )
 
     def authenticate(self):
         token = GrowwAPI.get_access_token(
@@ -131,6 +145,14 @@ class GrowwClient:
             )
         )
 
+    def get_order_status_by_reference(self, order_reference_id):
+        return self.call_with_reauth(
+            lambda: self.client.get_order_status_by_reference(
+                segment=self.client.SEGMENT_CASH,
+                order_reference_id=order_reference_id,
+            )
+        )
+
     # ------------------------------------------------------------------
     # GTT
     # ------------------------------------------------------------------
@@ -171,3 +193,56 @@ class GrowwClient:
                 smart_order_id=smart_order_id,
             )
         )
+
+    def get_available_margin_details(self):
+        return self.call_with_reauth(
+            lambda: self.client.get_available_margin_details()
+        )
+
+    def get_order_margin_details(self, orders):
+        return self.call_with_reauth(
+            lambda: self.client.get_order_margin_details(
+                segment=self.client.SEGMENT_CASH,
+                orders=orders,
+            )
+        )
+
+    def check_cnc_funds(
+        self,
+        *,
+        trading_symbol,
+        quantity,
+        order_type,
+        price,
+    ):
+        available = self.get_available_margin_details()
+
+        equity = available.get("equity_margin_details", {})
+        cnc_available = float(
+            equity.get("cnc_balance_available", 0.0)
+        )
+
+        margin_response = self.get_order_margin_details(
+            [
+                {
+                    "trading_symbol": trading_symbol,
+                    "transaction_type": "BUY",
+                    "quantity": quantity,
+                    "price": price,
+                    "order_type": order_type,
+                    "product": "CNC",
+                    "exchange": "NSE",
+                }
+            ]
+        )
+
+        total_requirement = float(
+            margin_response.get("total_requirement", 0.0)
+        )
+
+        return {
+            "cnc_balance_available": cnc_available,
+            "total_requirement": total_requirement,
+            "sufficient": cnc_available >= total_requirement,
+            "margin_details": margin_response,
+        }

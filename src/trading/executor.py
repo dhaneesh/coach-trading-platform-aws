@@ -220,6 +220,37 @@ def execute_buy(*, telegram_user_id, request):
             "Market is currently closed"
         )
 
+    # --------------------------------------------------------------
+    # Fresh CNC funds check immediately before the real BUY.
+    #
+    # We check both:
+    #   1. currently available CNC balance
+    #   2. exact Groww margin requirement for this order
+    # --------------------------------------------------------------
+
+    funds = groww.check_cnc_funds(
+        trading_symbol=symbol,
+        quantity=quantity,
+        order_type=groww.client.ORDER_TYPE_MARKET,
+        price=0.0,
+    )
+
+    logger.info(
+        "BUY funds check: symbol=%s quantity=%s available=%s required=%s sufficient=%s",
+        symbol,
+        quantity,
+        funds["cnc_balance_available"],
+        funds["total_requirement"],
+        funds["sufficient"],
+    )
+
+    if not funds["sufficient"]:
+        raise ValueError(
+            f"Insufficient CNC funds for {symbol}. "
+            f"Available ₹{funds['cnc_balance_available']:.2f}; "
+            f"required ₹{funds['total_requirement']:.2f}"
+        )
+
     order_reference_id = make_order_reference("OC")
 
     logger.info(
@@ -595,6 +626,20 @@ def lambda_handler(event, context):
             "body": json.dumps({
                 "status": "error",
                 "message": "Trading execution failed",
+            }),
+        }
+
+    except ValueError as exc:
+        logger.warning(
+            "Trading validation failed: %s",
+            exc,
+        )
+
+        return {
+            "statusCode": 400,
+            "body": json.dumps({
+                "status": "validation_error",
+                "message": str(exc),
             }),
         }
 
