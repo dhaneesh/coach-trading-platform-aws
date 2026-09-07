@@ -248,7 +248,7 @@ Resources:
       Layers:
         - !Ref GoogleDependenciesLayer
       Policies:
-        - DynamoDBReadPolicy:
+        - DynamoDBCrudPolicy:
             TableName: !Ref TradingTable
         - Statement:
             Effect: Allow
