@@ -1046,6 +1046,8 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     "orderPlaced": True,
                     "gttCreated": True,
                     "gttStatus": gtt_status,
+                    "executionStatus": "ORDER_PLACED",
+                    "dryRun": False,
                     "executionAt": datetime.now(TZ).isoformat(),
                 },
             )
@@ -1144,7 +1146,7 @@ def execute_request(*, user_id, request):
     groww = GrowwClient(groww_credentials)
 
     if status == "CONFIRMED_BUT_NOT_EXECUTED":
-        groww, result = execute_new_buy(
+        result = execute_new_buy(
             user_id=user_id,
             request=request,
         )

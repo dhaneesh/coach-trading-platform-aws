@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import uuid
 from datetime import datetime
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -146,6 +147,109 @@ def invoke_trading(user_id):
     return parse_lambda_response(response)
 
 
+
+# Completed requests are archived before the single active-request slot is reused.
+ARCHIVABLE_STATUSES = {
+    "ORDER_PLACED",
+    "DRY_RUN_EXECUTED",
+    "BUY_REJECTED",
+    "VALIDATION_FAILED",
+    "INSUFFICIENT_FUNDS",
+    "CANCELLED",
+}
+
+BLOCKING_STATUSES = {
+    "PENDING_CONFIRMATION",
+    "CONFIRMED_BUT_NOT_EXECUTED",
+    "BUY_SUBMITTING",
+    "BUY_SUBMITTED",
+    "BUY_EXECUTED",
+    "GTT_SUBMITTING",
+    "GTT_SUBMITTED",
+    "BUY_PENDING",
+    "GTT_PENDING",
+    "GTT_FAILED_MANUAL_ACTION_REQUIRED",
+    "EXECUTION_UNKNOWN_MANUAL_REVIEW",
+}
+
+
+def archive_completed_request(user_id, request):
+    status = str(request.get("status", "")).upper()
+    if status not in ARCHIVABLE_STATUSES:
+        return False
+
+    archive_key = (
+        f"TRADE#{request.get('createdAt', datetime.now(TZ).isoformat())}"
+        f"#{uuid.uuid4().hex[:12]}"
+    )
+    archived = dict(request)
+    archived["SK"] = archive_key
+    archived["archivedAt"] = datetime.now(TZ).isoformat()
+
+    # Preserve the completed request before releasing PENDING_BUY.
+    table().put_item(
+        Item=archived,
+        ConditionExpression="attribute_not_exists(PK) AND attribute_not_exists(SK)",
+    )
+
+    try:
+        table().delete_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PENDING_BUY"},
+            ConditionExpression="#s = :status",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":status": status},
+        )
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            logger.warning(
+                "PENDING_BUY changed while archiving; archive=%s", archive_key
+            )
+            return False
+        raise
+
+    logger.info(
+        "Archived completed BUY request: user=%s status=%s archiveKey=%s",
+        user_id, status, archive_key
+    )
+    return True
+
+
+def prepare_pending_buy_slot(user_id, chat_id):
+    existing = table().get_item(
+        Key={"PK": f"USER#{user_id}", "SK": "PENDING_BUY"}
+    ).get("Item")
+
+    if not existing:
+        return True
+
+    status = str(existing.get("status", "")).upper()
+
+    if status in BLOCKING_STATUSES:
+        send(
+            chat_id,
+            (
+                "A BUY request is already active or needs manual review.\n\n"
+                f"Symbol: {existing.get('symbol', '-')}\n"
+                f"Quantity: {existing.get('quantity', '-')}\n"
+                f"Status: {status}\n\n"
+                "Complete or cancel that request before starting another BUY."
+            ),
+        )
+        return False
+
+    if status in ARCHIVABLE_STATUSES:
+        return archive_completed_request(user_id, existing)
+
+    send(
+        chat_id,
+        (
+            "A previous BUY request has an unrecognized status and is blocked "
+            "for safety.\n\n"
+            f"Status: {status}"
+        ),
+    )
+    return False
+
 def execution_message(result):
     status = str(result.get("status", "")).upper()
     symbol = result.get("symbol", "-")
@@ -289,6 +393,10 @@ def handle_buy(user_id, chat_id, args):
 
     now = datetime.now(TZ).isoformat()
 
+    # Do not overwrite an existing PENDING_BUY request.
+    if not prepare_pending_buy_slot(user_id, chat_id):
+        return
+
     table().put_item(
         Item={
             "PK": f"USER#{user_id}",
@@ -309,21 +417,9 @@ def handle_buy(user_id, chat_id, args):
             "chatId": chat_id,
             "dryRun": True,
         },
-        ConditionExpression=(
-            "attribute_not_exists(PK) OR #s IN (:cancelled, :dryrun, "
-            ":terminal1, :terminal2, :terminal3, :terminal4, :terminal5)"
-        ),
-        ExpressionAttributeNames={"#s": "status"},
-        ExpressionAttributeValues={
-            ":cancelled": "CANCELLED",
-            ":dryrun": "DRY_RUN_EXECUTED",
-            ":terminal1": "BUY_REJECTED",
-            ":terminal2": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-            ":terminal3": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
-            ":terminal4": "INSUFFICIENT_FUNDS",
-            ":terminal5": "VALIDATION_FAILED",
-        },
+        ConditionExpression="attribute_not_exists(PK)",
     )
+
 
     send(
         chat_id,
