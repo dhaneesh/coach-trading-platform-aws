@@ -245,6 +245,8 @@ Resources:
     Properties:
       CodeUri: ../src/
       Handler: monitor.handler.lambda_summary
+      Layers:
+        - !Ref GoogleDependenciesLayer
       Policies:
         - DynamoDBReadPolicy:
             TableName: !Ref TradingTable
