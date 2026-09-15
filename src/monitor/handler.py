@@ -5,6 +5,8 @@ import urllib.request
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from decimal import Decimal
+import logging
+
 
 from common.aws import get_secret, table
 from monitor.sheets import (
@@ -14,6 +16,8 @@ from monitor.sheets import (
     get_sheet_rows,
 )
 from monitor.signals import extract_signals
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 TZ = ZoneInfo("Asia/Kolkata")
 
@@ -337,12 +341,19 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
         }
 
     monthly_file = current_file_name()
-
+    logger.info(
+        "MONITOR_CONTEXT monthly_file=%s market_hours=%s",
+        monthly_file,
+        in_market_hours(),
+    )
     try:
+        logger.info("MONITOR_START monthly_file=%s", monthly_file)
+        logger.info("GOOGLE_AUTH_START")
         drive, sheets = build_services(
             os.environ["GOOGLE_SECRET_ARN"]
         )
-
+        logger.info("GOOGLE_AUTH_SUCCESS")
+        logger.info("DRIVE_SEARCH_START filename=%s", monthly_file)
         spreadsheet = find_spreadsheet(
             drive,
             monthly_file,
@@ -350,6 +361,10 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
                 "GOOGLE_SPREADSHEET_FOLDER_ID",
                 "",
             ),
+        )
+        logger.info(
+            "DRIVE_SEARCH_RESULT found=%s",
+            bool(spreadsheet),
         )
 
         if not spreadsheet:
@@ -364,7 +379,14 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
             }
 
         spreadsheet_id = spreadsheet["id"]
-
+        logger.info(
+            "SHEETS_READ_START spreadsheet_id=%s range=%s",
+            spreadsheet_id,
+            os.environ.get(
+                "GOOGLE_SHEET_READ_RANGE",
+                "A1:I250",
+            ),
+        )
         rows = get_sheet_rows(
             sheets,
             spreadsheet_id,
@@ -373,7 +395,10 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
                 "A1:I250",
             ),
         )
-
+        logger.info(
+            "SHEETS_READ_SUCCESS rows=%d",
+            len(rows),
+        )
         signals = extract_signals(
             rows,
             monthly_file,
@@ -465,16 +490,24 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
         }
 
     except Exception as exc:
+        logger.exception(
+            "MONITOR_FAILED monthly_file=%s error_type=%s error=%s",
+            monthly_file,
+            type(exc).__name__,
+            str(exc),
+        )
+
         try:
             send_telegram(
                 "⚠️ COACH SHEET MONITOR ERROR\n"
                 "Unable to access the current month's coach sheet."
             )
         except Exception:
-            pass
+            logger.exception("MONITOR_ERROR_TELEGRAM_FAILED")
 
         return {
             "status": "error",
+            "error_type": type(exc).__name__,
             "error": str(exc),
             "monthlyFile": monthly_file,
         }
@@ -483,6 +516,11 @@ def monitor(event=None, context=None, baseline_only=False, ignore_hours=False):
 def summary(event=None, context=None):
     db = table()
     monthly_file = current_file_name()
+    logger.info(
+        "MONITOR_CONTEXT monthly_file=%s market_hours=%s",
+        monthly_file,
+        in_market_hours(),
+    )
     today = today_key()
 
     summary_key = f"{today}"

@@ -28,8 +28,8 @@ def google_credentials(secret_arn):
         client_id=secret["client_id"],
         client_secret=secret["client_secret"],
         scopes=[
-            "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/spreadsheets.readonly",
         ],
     )
 
