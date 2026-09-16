@@ -36,6 +36,15 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
+  
+  TradingEc2AmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-055c6ceed72cc818f
+    Description: Amazon Linux 2023 x86_64 AMI
+
+  TradingEc2InstanceType:
+    Type: String
+    Default: t3.micro
 
 Resources:
 
@@ -208,6 +217,112 @@ Resources:
         - Key: Name
           Value: coach-trading-lambda-sg
 
+  # ------------------------------------------------------------------
+  # EC2 Trading Worker
+  # Temporary parallel path while Trading Lambda/NAT remains active.
+  # EC2 uses its own Elastic IP for direct Groww connectivity.
+  # ------------------------------------------------------------------
+
+  TradingEc2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound HTTPS for EC2 Trading Worker
+      VpcId: !Ref TradingVpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: coach-trading-ec2-sg
+
+  TradingEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coach-trading-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: coach-trading-ec2-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt TradingTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GrowwSecretArn
+
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/stop-loss-percent
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  TradingEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: coach-trading-ec2-instance-profile
+      Roles:
+        - !Ref TradingEc2Role
+
+  TradingEc2Eip:
+    Type: AWS::EC2::EIP
+    DependsOn: TradingVpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: coach-trading-ec2-eip
+
+  TradingEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref TradingEc2AmiId
+      InstanceType: !Ref TradingEc2InstanceType
+      SubnetId: !Ref TradingPublicSubnet
+      SecurityGroupIds:
+        - !Ref TradingEc2SecurityGroup
+      IamInstanceProfile: !Ref TradingEc2InstanceProfile
+      Monitoring: false
+      Tags:
+        - Key: Name
+          Value: coach-trading-ec2-worker
+
+  TradingEc2EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref TradingEc2Instance
+      AllocationId: !GetAtt TradingEc2Eip.AllocationId
+
   MonitorFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -341,3 +456,14 @@ Outputs:
 
   TradingNatGatewayId:
     Value: !Ref TradingNatGateway
+
+  TradingEc2InstanceId:
+    Value: !Ref TradingEc2Instance
+
+  TradingEc2Eip:
+    Description: Static public IPv4 address for EC2 Trading Worker
+    Value: !Ref TradingEc2Eip
+
+  TradingEc2PrivateIp:
+    Description: Private IPv4 address for EC2 Trading Worker
+    Value: !GetAtt TradingEc2Instance.PrivateIp
