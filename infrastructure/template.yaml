@@ -11,6 +11,7 @@ Globals:
       Variables:
         DYNAMODB_TABLE: !Ref TradingTable
         PROFIT_PARAMETER_NAME: /coach-trading/profit-percent
+        STOP_LOSS_PARAMETER_NAME: /coach-trading/stop-loss-percent
         TELEGRAM_AUTHORIZED_USER_ID: !Ref TelegramAuthorizedUserId
         GROWW_SECRET_ARN: !Ref GrowwSecretArn
         GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
@@ -222,7 +223,9 @@ Resources:
             Effect: Allow
             Action:
               - ssm:GetParameter
-            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/stop-loss-percent
         - Statement:
             Effect: Allow
             Action:
