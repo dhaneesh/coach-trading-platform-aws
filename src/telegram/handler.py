@@ -354,6 +354,17 @@ def execution_message(result):
             "Please do not send another CONFIRM."
         )
 
+    if status == "STOP_PENDING":
+        return (
+            "BUY EXECUTED; STOP-LOSS GTT IS PENDING.\n\n"
+            f"Symbol: {symbol}\n"
+            f"Quantity: {quantity}\n"
+            f"BUY average: {result.get('buy_average_price', '-')}\n"
+            f"SELL GTT target: {result.get('gtt_target_price', '-')}\n"
+            f"Stop-loss: {result.get('stop_loss_trigger', '-')}\n\n"
+            f"{result.get('message', 'Stop-loss GTT requires follow-up.')}"
+        )
+
     return (
         "Trading execution failed.\n\n"
         f"Symbol: {symbol}\n"

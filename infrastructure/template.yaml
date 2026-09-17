@@ -273,6 +273,7 @@ Resources:
                   - secretsmanager:GetSecretValue
                 Resource:
                   - !Ref GrowwSecretArn
+                  - !Ref TelegramBotTokenSecretArn
 
               - Effect: Allow
                 Action:
