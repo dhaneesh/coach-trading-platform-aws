@@ -489,24 +489,18 @@ def handle_confirm(user_id, chat_id):
         )
         return
 
-    result = invoke_trading(user_id)
-
-    try:
-        body = result.get("body", "{}")
-        payload = json.loads(body) if isinstance(body, str) else body
-    except (TypeError, json.JSONDecodeError):
-        payload = {
-            "status": "error",
-            "message": "Trading Lambda returned an unreadable response.",
-        }
-
     logger.info(
-        "Trading result: statusCode=%s payload=%s",
-        result.get("statusCode"),
-        payload,
+        "BUY confirmed and queued for EC2 trading worker: user_id=%s",
+        user_id,
     )
 
-    send(chat_id, execution_message(payload))
+    send(
+        chat_id,
+        (
+            "BUY confirmed and queued.\n"
+            "The trading worker will process the request shortly."
+        ),
+    )
 
 
 def handle_cancel(user_id, chat_id):
