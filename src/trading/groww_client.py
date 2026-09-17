@@ -185,6 +185,35 @@ class GrowwClient:
             )
         )
 
+    def create_sell_stop_gtt(
+        self,
+        *,
+        trading_symbol: str,
+        quantity: int,
+        trigger_price: float,
+        stop_price: float,
+        reference_id: str,
+    ):
+        return self.call_with_reauth(
+            lambda: self.client.create_smart_order(
+                smart_order_type=self.client.SMART_ORDER_TYPE_GTT,
+                reference_id=reference_id,
+                segment=self.client.SEGMENT_CASH,
+                trading_symbol=trading_symbol,
+                quantity=quantity,
+                product_type=self.client.PRODUCT_CNC,
+                exchange=self.client.EXCHANGE_NSE,
+                duration=self.client.VALIDITY_DAY,
+                trigger_price=f"{trigger_price:.2f}",
+                trigger_direction=self.client.TRIGGER_DIRECTION_DOWN,
+                order={
+                    "order_type": self.client.ORDER_TYPE_STOP_LOSS,
+                    "price": f"{stop_price:.2f}",
+                    "transaction_type": self.client.TRANSACTION_TYPE_SELL,
+                },
+            )
+        )
+
     def get_smart_order(self, smart_order_id):
         return self.call_with_reauth(
             lambda: self.client.get_smart_order(
