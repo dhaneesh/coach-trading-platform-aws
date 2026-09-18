@@ -338,6 +338,39 @@ def execute_new_buy(*, user_id, request):
         )
     )
 
+    trading_enabled = (
+        os.environ.get(
+            "TRADING_ENABLED",
+            "false",
+        ).strip().lower()
+        == "true"
+    )
+
+    market_open = is_market_open()
+
+    if not trading_enabled:
+        target_price = entry_price * (
+            1 + profit_percent / 100
+        )
+
+        estimated_order_value = entry_price * quantity
+
+        return (
+            None,
+            dry_run_execution(
+                symbol=symbol,
+                quantity=quantity,
+                entry_label=entry_label,
+                entry_price=entry_price,
+                profit_percent=profit_percent,
+                target_price=target_price,
+                groww_symbol=symbol,
+                ltp=entry_price,
+                estimated_order_value=estimated_order_value,
+                market_open=market_open,
+            ),
+        )
+
     groww_credentials = get_secret(
         os.environ["GROWW_SECRET_ARN"]
     )
@@ -385,33 +418,6 @@ def execute_new_buy(*, user_id, request):
             f"Estimated order value ₹{estimated_order_value:.2f} "
             f"exceeds maximum allowed value "
             f"₹{max_order_value:.2f}"
-        )
-
-    market_open = is_market_open()
-
-    trading_enabled = (
-        os.environ.get(
-            "TRADING_ENABLED",
-            "false",
-        ).strip().lower()
-        == "true"
-    )
-
-    if not trading_enabled:
-        return (
-            groww,
-            dry_run_execution(
-                symbol=symbol,
-                quantity=quantity,
-                entry_label=entry_label,
-                entry_price=entry_price,
-                profit_percent=profit_percent,
-                target_price=target_price,
-                groww_symbol=groww_symbol,
-                ltp=ltp,
-                estimated_order_value=estimated_order_value,
-                market_open=market_open,
-            ),
         )
 
     if not market_open:
@@ -729,6 +735,115 @@ def find_gtt_with_retries(groww, reference):
 
 def continue_buy_and_gtt(*, user_id, request, groww):
     status = request.get("status")
+
+    # --------------------------------------------------------------
+    # DRY-RUN GTT lifecycle
+    # --------------------------------------------------------------
+    if os.environ.get("TRADING_ENABLED", "false").strip().lower() != "true":
+
+        if status == "BUY_EXECUTED":
+            gtt_reference = request.get("gttReference") or (
+                f"DRYRUN-GTT-{request['symbol']}"
+            )
+            stop_reference = request.get("stopLossReference") or (
+                f"DRYRUN-STP-{request['symbol']}"
+            )
+
+            mark_state(
+                user_id=user_id,
+                expected_status="BUY_EXECUTED",
+                new_status="GTT_SUBMITTED",
+                extra={
+                    "gttReference": gtt_reference,
+                    "gttId": gtt_reference,
+                    "gttStatus": "ACTIVE",
+                    "gttCreated": True,
+                    "gttSubmittedAt": datetime.now(TZ).isoformat(),
+                    "executionStatus": "TARGET_GTT_ACTIVE",
+                    "stopLossReference": stop_reference,
+                },
+            )
+
+            return {
+                "status": "DRY_RUN_TARGET_GTT_SUBMITTED",
+                "symbol": request["symbol"],
+                "quantity": int(request["quantity"]),
+                "gtt_target_price": request.get("gttTargetPrice"),
+                "gtt_id": gtt_reference,
+                "gtt_status": "ACTIVE",
+                "stop_loss_status": "NOT_SUBMITTED",
+                "order_placed": False,
+                "gtt_created": True,
+            }
+
+        if status == "GTT_SUBMITTED":
+            stop_reference = request.get("stopLossReference") or (
+                f"DRYRUN-STP-{request['symbol']}"
+            )
+
+            mark_state(
+                user_id=user_id,
+                expected_status="GTT_SUBMITTED",
+                new_status="STOP_SUBMITTED",
+                extra={
+                    "gttStatus": "ACTIVE",
+                    "gttCreated": True,
+                    "executionStatus": "TARGET_GTT_ACTIVE",
+                    "stopLossReference": stop_reference,
+                    "stopLossId": stop_reference,
+                    "stopLossStatus": "ACTIVE",
+                    "stopLossSubmittedAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "DRY_RUN_STOP_GTT_SUBMITTED",
+                "symbol": request["symbol"],
+                "quantity": int(request["quantity"]),
+                "gtt_id": request.get("gttId"),
+                "gtt_status": "ACTIVE",
+                "stop_loss_id": stop_reference,
+                "stop_loss_status": "ACTIVE",
+                "order_placed": False,
+                "gtt_created": True,
+            }
+
+        if status == "STOP_SUBMITTED":
+            mark_state(
+                user_id=user_id,
+                expected_status="STOP_SUBMITTED",
+                new_status="ORDER_PLACED",
+                extra={
+                    "buyStatus": "EXECUTED",
+                    "gttCreated": True,
+                    "gttStatus": "ACTIVE",
+                    "stopLossStatus": "ACTIVE",
+                    "orderPlaced": False,
+                    "executionStatus": "DRY_RUN_PROTECTED_POSITION",
+                    "executionAt": datetime.now(TZ).isoformat(),
+                },
+            )
+
+            return {
+                "status": "DRY_RUN_GTT_COMPLETE",
+                "symbol": request["symbol"],
+                "quantity": int(request["quantity"]),
+                "gtt_target_price": request.get("gttTargetPrice"),
+                "gtt_id": request.get("gttId"),
+                "gtt_status": "ACTIVE",
+                "stop_loss_price": request.get("stopLossPrice"),
+                "stop_loss_id": request.get("stopLossId"),
+                "stop_loss_status": "ACTIVE",
+                "order_placed": False,
+                "gtt_created": True,
+            }
+
+        return {
+            "status": "DRY_RUN_STATE_READY",
+            "symbol": request.get("symbol"),
+            "quantity": int(request.get("quantity", 0)),
+            "state": status,
+        }
 
     if status == "BUY_SUBMITTED":
         groww_order_id = request.get("buyOrderId")
@@ -1712,12 +1827,22 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
 def execute_request(*, user_id, request):
     status = request.get("status")
-
-    groww_credentials = get_secret(
-        os.environ["GROWW_SECRET_ARN"]
+    trading_enabled = (
+        os.environ.get(
+            "TRADING_ENABLED",
+            "false",
+        ).strip().lower()
+        == "true"
     )
 
-    groww = GrowwClient(groww_credentials)
+    groww = None
+
+    if trading_enabled:
+        groww_credentials = get_secret(
+            os.environ["GROWW_SECRET_ARN"]
+        )
+
+        groww = GrowwClient(groww_credentials)
 
     if status == "CONFIRMED_BUT_NOT_EXECUTED":
         result = execute_new_buy(
