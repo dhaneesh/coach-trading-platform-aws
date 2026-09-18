@@ -1419,7 +1419,16 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
             except Exception as exc:
                 error_text = str(exc)
+                groww_error_code = getattr(exc, "code", None)
+                groww_error_message = getattr(exc, "msg", None)
 
+                logger.error(
+                    "Stop-loss GTT failed: type=%s code=%s msg=%s error=%s",
+                    type(exc).__name__,
+                    groww_error_code,
+                    groww_error_message,
+                    error_text,
+                )
                 # Groww uses reference_id as an idempotency key.
                 # A duplicate reference means we must NOT create another
                 # stop order with a different reference.
@@ -1457,6 +1466,8 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                         "stopLossStatus": "PENDING_VERIFICATION",
                         "stopLossCreateException": True,
                         "stopLossCreateError": error_text,
+                        "growwErrorCode": str(groww_error_code) if groww_error_code else None,
+                        "growwErrorMessage": groww_error_message,
                         "stopPendingAt": datetime.now(TZ).isoformat(),
                     },
                 )
