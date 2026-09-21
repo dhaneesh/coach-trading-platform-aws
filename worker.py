@@ -22,7 +22,6 @@ EXECUTABLE_STATUSES = {
     "BUY_EXECUTED",
     "GTT_SUBMITTING",
     "GTT_SUBMITTED",
-    "STOP_SUBMITTED",
 }
 
 
@@ -138,17 +137,6 @@ def execution_message(result):
             "No second GTT will be created automatically."
         )
 
-    if status == "STOP_PENDING":
-        return (
-            "BUY EXECUTED; STOP-LOSS GTT IS PENDING.\n\n"
-            f"Symbol: {symbol}\n"
-            f"Quantity: {quantity}\n"
-            f"BUY average: {result.get('buy_average_price', '-')}\n"
-            f"SELL GTT target: {result.get('gtt_target_price', '-')}\n"
-            f"Stop-loss: {result.get('stop_loss_trigger', '-')}\n\n"
-            f"{result.get('message', 'Stop-loss GTT requires follow-up.')}"
-        )
-
     if status == "GTT_FAILED_MANUAL_ACTION_REQUIRED":
         return (
             "BUY WAS EXECUTED, BUT SELL GTT NEEDS MANUAL ACTION.\n\n"
@@ -213,10 +201,6 @@ def notify_once(request, result):
         result.setdefault(
             "gtt_target_price",
             request.get("gttTargetPrice"),
-        )
-        result.setdefault(
-            "stop_loss_trigger",
-            request.get("stopLossPrice"),
         )
 
     message = execution_message(result)
@@ -303,7 +287,6 @@ def find_executable_requests():
         ":s4": "BUY_EXECUTED",
         ":s5": "GTT_SUBMITTING",
         ":s6": "GTT_SUBMITTED",
-        ":s7": "STOP_SUBMITTED",
     }
 
     response = table.scan(
