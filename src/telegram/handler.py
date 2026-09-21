@@ -17,8 +17,6 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 TZ = ZoneInfo("Asia/Kolkata")
-lambda_client = boto3.client("lambda")
-
 
 def send(chat_id, text):
     import urllib.request
@@ -98,55 +96,6 @@ def find_active_signal(symbol, entry):
             return item
 
     return None
-
-
-def trading_function_name():
-    value = os.environ.get("TRADING_FUNCTION_NAME", "").strip()
-    if not value:
-        raise RuntimeError(
-            "TRADING_FUNCTION_NAME is not configured"
-        )
-    return value
-
-
-def parse_lambda_response(response):
-    payload = response.get("Payload")
-    if payload is None:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "status": "error",
-                "message": "Trading Lambda returned no payload",
-            }),
-        }
-
-    raw = payload.read()
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {
-            "statusCode": 500,
-            "body": json.dumps({
-                "status": "error",
-                "message": "Trading Lambda returned invalid JSON",
-            }),
-        }
-
-
-def invoke_trading(user_id):
-    response = lambda_client.invoke(
-        FunctionName=trading_function_name(),
-        InvocationType="RequestResponse",
-        Payload=json.dumps({
-            "telegram_user_id": user_id,
-        }).encode("utf-8"),
-    )
-    return parse_lambda_response(response)
-
-
 
 # Completed requests are archived before the single active-request slot is reused.
 ARCHIVABLE_STATUSES = {

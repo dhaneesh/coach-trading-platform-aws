@@ -123,93 +123,6 @@ Resources:
         - Key: Name
           Value: coach-trading-public-subnet
 
-  TradingPrivateSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref TradingVpc
-      CidrBlock: 10.20.2.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: false
-      Tags:
-        - Key: Name
-          Value: coach-trading-private-subnet
-
-  TradingPublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref TradingVpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-public-rt
-
-  TradingPublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: TradingVpcGatewayAttachment
-    Properties:
-      RouteTableId: !Ref TradingPublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref TradingInternetGateway
-
-  TradingPublicSubnetRouteAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref TradingPublicSubnet
-      RouteTableId: !Ref TradingPublicRouteTable
-
-  TradingNatEip:
-    Type: AWS::EC2::EIP
-    DependsOn: TradingVpcGatewayAttachment
-    Properties:
-      Domain: vpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-nat-eip
-
-  TradingNatGateway:
-    Type: AWS::EC2::NatGateway
-    DependsOn: TradingPublicSubnetRouteAssociation
-    Properties:
-      AllocationId: !GetAtt TradingNatEip.AllocationId
-      SubnetId: !Ref TradingPublicSubnet
-      Tags:
-        - Key: Name
-          Value: coach-trading-nat
-
-  TradingPrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref TradingVpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-private-rt
-
-  TradingPrivateRoute:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref TradingPrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref TradingNatGateway
-
-  TradingPrivateSubnetRouteAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref TradingPrivateSubnet
-      RouteTableId: !Ref TradingPrivateRouteTable
-
-  TradingSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Outbound HTTPS for Trading Lambda
-      VpcId: !Ref TradingVpc
-      SecurityGroupEgress:
-        - IpProtocol: tcp
-          FromPort: 443
-          ToPort: 443
-          CidrIp: 0.0.0.0/0
-      Tags:
-        - Key: Name
-          Value: coach-trading-lambda-sg
-
   # ------------------------------------------------------------------
   # EC2 Trading Worker
   # Temporary parallel path while Trading Lambda/NAT remains active.
@@ -381,9 +294,6 @@ Resources:
     Properties:
       CodeUri: ../src/
       Handler: telegram.handler.lambda_handler
-      Environment:
-        Variables:
-          TRADING_FUNCTION_NAME: !Ref TradingFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref TradingTable
@@ -392,47 +302,12 @@ Resources:
             Action:
               - secretsmanager:GetSecretValue
             Resource: !Ref TelegramBotTokenSecretArn
-        - Statement:
-            Effect: Allow
-            Action:
-              - lambda:InvokeFunction
-            Resource: !GetAtt TradingFunction.Arn
       Events:
         TelegramWebhook:
           Type: HttpApi
           Properties:
             Path: /telegram/webhook
             Method: POST
-
-  TradingFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ../src/
-      Runtime: python3.12
-      Handler: trading.executor.lambda_handler
-      Layers:
-        - !Ref GrowwDependenciesLayer
-      Timeout: 60
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref TradingSecurityGroup
-        SubnetIds:
-          - !Ref TradingPrivateSubnet
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref TradingTable
-        - Statement:
-            Effect: Allow
-            Action:
-              - secretsmanager:GetSecretValue
-            Resource: !Ref GrowwSecretArn
-        - Statement:
-            Effect: Allow
-            Action:
-              - ssm:GetParameter
-            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-
 Outputs:
   ApiEndpoint:
     Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
@@ -442,16 +317,10 @@ Outputs:
 
   GrowwWhitelistIp:
     Description: Static public IPv4 address to whitelist in Groww API settings
-    Value: !Ref TradingNatEip
+    Value: !Ref TradingEc2Eip
 
   TradingVpcId:
     Value: !Ref TradingVpc
-
-  TradingPrivateSubnetId:
-    Value: !Ref TradingPrivateSubnet
-
-  TradingNatGatewayId:
-    Value: !Ref TradingNatGateway
 
   TradingEc2InstanceId:
     Value: !Ref TradingEc2Instance
