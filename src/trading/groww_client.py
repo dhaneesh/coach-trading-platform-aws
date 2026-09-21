@@ -36,10 +36,44 @@ class GrowwClient:
             )
 
     def authenticate(self):
-        token = GrowwAPI.get_access_token(
-            api_key=self.totp_token,
-            totp=pyotp.TOTP(self.totp_secret).now(),
+        import requests
+        import uuid
+
+        url = "https://api.groww.in/v1/token/api/access"
+
+        headers = {
+            "x-request-id": str(uuid.uuid4()),
+            "Authorization": "Bearer " + self.totp_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-client-id": "growwapi",
+            "x-client-platform": "growwapi-python-client",
+            "x-client-platform-version": "1.5.0",
+            "x-api-version": "1.0",
+        }
+
+        payload = {
+            "key_type": "totp",
+            "totp": pyotp.TOTP(self.totp_secret).now(),
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15,
         )
+
+        response.raise_for_status()
+
+        data = response.json()
+        token = data.get("token")
+
+        if not token:
+            raise RuntimeError(
+                "Groww authentication succeeded but no access token was returned"
+            )
+
         self.client = GrowwAPI(token)
 
     @staticmethod
