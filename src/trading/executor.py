@@ -319,7 +319,7 @@ def execute_new_buy(*, user_id, request):
     )
 
     trading_enabled = (
-        get_parameter("/coach-trading/trading-enabled", default="false")
+        get_parameter("/coach-trading/trading-enabled")
         .strip()
         .lower()
         == "true"
@@ -719,7 +719,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
     # DRY-RUN GTT lifecycle
     # --------------------------------------------------------------
     trading_enabled = (
-        get_parameter("/coach-trading/trading-enabled", default="false")
+        get_parameter("/coach-trading/trading-enabled")
         .strip()
         .lower()
         == "true"
@@ -1267,7 +1267,7 @@ def execute_request(*, user_id, request):
     status = request.get("status")
 
     trading_enabled = (
-        get_parameter("/coach-trading/trading-enabled", default="false")
+        get_parameter("/coach-trading/trading-enabled")
         .strip()
         .lower()
         == "true"
