@@ -156,19 +156,17 @@ class GrowwClient:
         quantity,
         order_reference_id,
     ):
-        return self.call_with_reauth(
-            lambda: self.client.place_order(
-                validity=self.client.VALIDITY_DAY,
-                exchange="NSE",
-                order_type=self.client.ORDER_TYPE_MARKET,
-                product="CNC",
-                quantity=quantity,
-                segment=self.client.SEGMENT_CASH,
-                trading_symbol=trading_symbol,
-                transaction_type="BUY",
-                order_reference_id=order_reference_id,
-                price=0.0,
-            )
+        return self.client.place_order(
+            validity=self.client.VALIDITY_DAY,
+            exchange="NSE",
+            order_type=self.client.ORDER_TYPE_MARKET,
+            product="CNC",
+            quantity=quantity,
+            segment=self.client.SEGMENT_CASH,
+            trading_symbol=trading_symbol,
+            transaction_type="BUY",
+            order_reference_id=order_reference_id,
+            price=0.0,
         )
 
     def get_order_detail(self, groww_order_id):
@@ -199,34 +197,23 @@ class GrowwClient:
         trigger_price,
         reference_id,
     ):
-        try:
-            return self.call_with_reauth(
-                lambda: self.client.create_smart_order(
-                    smart_order_type="GTT",
-                    segment=self.client.SEGMENT_CASH,
-                    trading_symbol=trading_symbol,
-                    quantity=quantity,
-                    product_type="CNC",
-                    exchange="NSE",
-                    duration=self.client.VALIDITY_DAY,
-                    reference_id=reference_id,
-                    trigger_price=str(trigger_price),
-                    trigger_direction="UP",
-                    order={
-                        "order_type": self.client.ORDER_TYPE_LIMIT,
-                        "price": float(trigger_price),
-                        "transaction_type": "SELL",
-                    },
-                )
-            )
-        except Exception as exc:
-            existing_gtt = self.find_gtt_by_reference(reference_id)
-
-            if existing_gtt:
-                return existing_gtt
-
-            raise exc
-
+        return self.client.create_smart_order(
+            smart_order_type="GTT",
+            segment=self.client.SEGMENT_CASH,
+            trading_symbol=trading_symbol,
+            quantity=quantity,
+            product_type="CNC",
+            exchange="NSE",
+            duration=self.client.VALIDITY_DAY,
+            reference_id=reference_id,
+            trigger_price=str(trigger_price),
+            trigger_direction="UP",
+            order={
+                "order_type": self.client.ORDER_TYPE_LIMIT,
+                "price": float(trigger_price),
+                "transaction_type": "SELL",
+            },
+        )
 
     def get_smart_order(self, smart_order_id):
         return self.call_with_reauth(
