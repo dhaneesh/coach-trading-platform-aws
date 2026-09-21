@@ -16,7 +16,6 @@ Globals:
         GROWW_SECRET_ARN: !Ref GrowwSecretArn
         GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
         TELEGRAM_BOT_TOKEN_SECRET_ARN: !Ref TelegramBotTokenSecretArn
-        TRADING_ENABLED: !Ref TradingEnabled
 
 Parameters:
   TelegramAuthorizedUserId:
@@ -30,13 +29,6 @@ Parameters:
 
   TelegramBotTokenSecretArn:
     Type: String
-
-  TradingEnabled:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
   
   TradingEc2AmiId:
     Type: AWS::EC2::Image::Id

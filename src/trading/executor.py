@@ -62,26 +62,6 @@ def round_down_to_tick(price, tick_size):
     )
 
 
-def calculate_stop_loss(entry_price, stop_loss_percent, tick_size):
-    raw_price = entry_price * (1 - stop_loss_percent / 100)
-
-    return round_down_to_tick(
-        raw_price,
-        tick_size,
-    )
-
-def calculate_stop_loss_limit(stop_loss_price, tick_size):
-    """
-    Keep the SELL stop-limit price slightly below the trigger,
-    then align it to the exchange tick size.
-    """
-    raw_limit = stop_loss_price * 0.998
-
-    return round_down_to_tick(
-        raw_limit,
-        tick_size,
-    )
-
 def is_market_open():
     now = datetime.now(TZ)
 
@@ -339,10 +319,9 @@ def execute_new_buy(*, user_id, request):
     )
 
     trading_enabled = (
-        os.environ.get(
-            "TRADING_ENABLED",
-            "false",
-        ).strip().lower()
+        get_parameter("/coach-trading/trading-enabled", default="false")
+        .strip()
+        .lower()
         == "true"
     )
 
@@ -739,14 +718,17 @@ def continue_buy_and_gtt(*, user_id, request, groww):
     # --------------------------------------------------------------
     # DRY-RUN GTT lifecycle
     # --------------------------------------------------------------
-    if os.environ.get("TRADING_ENABLED", "false").strip().lower() != "true":
+    trading_enabled = (
+        get_parameter("/coach-trading/trading-enabled", default="false")
+        .strip()
+        .lower()
+        == "true"
+    )
+    if not trading_enabled:
 
         if status == "BUY_EXECUTED":
             gtt_reference = request.get("gttReference") or (
                 f"DRYRUN-GTT-{request['symbol']}"
-            )
-            stop_reference = request.get("stopLossReference") or (
-                f"DRYRUN-STP-{request['symbol']}"
             )
 
             mark_state(
@@ -760,7 +742,6 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     "gttCreated": True,
                     "gttSubmittedAt": datetime.now(TZ).isoformat(),
                     "executionStatus": "TARGET_GTT_ACTIVE",
-                    "stopLossReference": stop_reference,
                 },
             )
 
@@ -771,69 +752,6 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                 "gtt_target_price": request.get("gttTargetPrice"),
                 "gtt_id": gtt_reference,
                 "gtt_status": "ACTIVE",
-                "stop_loss_status": "NOT_SUBMITTED",
-                "order_placed": False,
-                "gtt_created": True,
-            }
-
-        if status == "GTT_SUBMITTED":
-            stop_reference = request.get("stopLossReference") or (
-                f"DRYRUN-STP-{request['symbol']}"
-            )
-
-            mark_state(
-                user_id=user_id,
-                expected_status="GTT_SUBMITTED",
-                new_status="STOP_SUBMITTED",
-                extra={
-                    "gttStatus": "ACTIVE",
-                    "gttCreated": True,
-                    "executionStatus": "TARGET_GTT_ACTIVE",
-                    "stopLossReference": stop_reference,
-                    "stopLossId": stop_reference,
-                    "stopLossStatus": "ACTIVE",
-                    "stopLossSubmittedAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            return {
-                "status": "DRY_RUN_STOP_GTT_SUBMITTED",
-                "symbol": request["symbol"],
-                "quantity": int(request["quantity"]),
-                "gtt_id": request.get("gttId"),
-                "gtt_status": "ACTIVE",
-                "stop_loss_id": stop_reference,
-                "stop_loss_status": "ACTIVE",
-                "order_placed": False,
-                "gtt_created": True,
-            }
-
-        if status == "STOP_SUBMITTED":
-            mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTED",
-                new_status="ORDER_PLACED",
-                extra={
-                    "buyStatus": "EXECUTED",
-                    "gttCreated": True,
-                    "gttStatus": "ACTIVE",
-                    "stopLossStatus": "ACTIVE",
-                    "orderPlaced": False,
-                    "executionStatus": "DRY_RUN_PROTECTED_POSITION",
-                    "executionAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            return {
-                "status": "DRY_RUN_GTT_COMPLETE",
-                "symbol": request["symbol"],
-                "quantity": int(request["quantity"]),
-                "gtt_target_price": request.get("gttTargetPrice"),
-                "gtt_id": request.get("gttId"),
-                "gtt_status": "ACTIVE",
-                "stop_loss_price": request.get("stopLossPrice"),
-                "stop_loss_id": request.get("stopLossId"),
-                "stop_loss_status": "ACTIVE",
                 "order_placed": False,
                 "gtt_created": True,
             }
@@ -915,11 +833,11 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
             average_fill_price = float(average_fill_price)
 
-            stop_loss_percent = float(
+            profit_percent = float(
                 get_parameter(
                     os.environ.get(
-                        "STOP_LOSS_PARAMETER_NAME",
-                        "/coach-trading/stop-loss-percent",
+                        "PROFIT_PARAMETER_NAME",
+                        "/coach-trading/profit-percent",
                     )
                 )
             )
@@ -946,26 +864,19 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     ),
                 }
 
-            stop_loss_price = calculate_stop_loss(
+            target_price = calculate_target(
                 average_fill_price,
-                stop_loss_percent,
-                tick_size,
-            )
-
-            stop_loss_limit_price = calculate_stop_loss_limit(
-                stop_loss_price,
+                profit_percent,
                 tick_size,
             )
 
             logger.info(
-                "Stop-loss calculated: symbol=%s "
-                "average_fill=%s stop_percent=%s "
-                "stop_trigger=%s stop_limit=%s",
+                "Target calculated from actual BUY fill: "
+                "symbol=%s average_fill=%s profit_percent=%s target=%s",
                 request["symbol"],
                 average_fill_price,
-                stop_loss_percent,
-                stop_loss_price,
-                stop_loss_limit_price,
+                profit_percent,
+                target_price,
             )
 
             mark_state(
@@ -976,10 +887,8 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     "buyStatus": buy_status,
                     "buyAveragePrice": average_fill_price,
                     "buyExecutedAt": datetime.now(TZ).isoformat(),
-                    "stopLossPercent": stop_loss_percent,
-                    "stopLossPrice": stop_loss_price,
-                    "stopLossLimitPrice": stop_loss_limit_price,
-                    "stopLossStatus": "NOT_SUBMITTED",
+                    "gttTargetPrice": target_price,
+                    "profitPercent": profit_percent,
                 },
             )
 
@@ -1025,15 +934,10 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
     if request.get("status") == "BUY_EXECUTED":
         gtt_reference = request.get("gttReference")
-        stop_reference = request.get("stopLossReference")
 
-        # Generate BOTH references before submitting either GTT.
-        # They are persisted so a retry never creates a new reference.
+        # Persist one stable target-GTT reference before submission.
         if not gtt_reference:
             gtt_reference = make_order_reference("GTT")
-
-        if not stop_reference:
-            stop_reference = make_order_reference("STP")
 
         claimed = safe_mark_state(
             user_id=user_id,
@@ -1041,7 +945,6 @@ def continue_buy_and_gtt(*, user_id, request, groww):
             new_status="GTT_SUBMITTING",
             extra={
                 "gttReference": gtt_reference,
-                "stopLossReference": stop_reference,
                 "gttSubmittingAt": datetime.now(TZ).isoformat(),
             },
         )
@@ -1296,14 +1199,14 @@ def continue_buy_and_gtt(*, user_id, request, groww):
             mark_state(
                 user_id=user_id,
                 expected_status="GTT_SUBMITTED",
-                new_status="STOP_SUBMITTING",
+                new_status="TARGET_GTT_ACTIVE",
                 extra={
                     "buyStatus": "EXECUTED",
                     "gttStatus": gtt_status,
                     "gttCreated": True,
                     "orderPlaced": False,
                     "executionStatus": "TARGET_GTT_ACTIVE",
-                    "stopSubmittingAt": datetime.now(TZ).isoformat(),
+                    "executionAt": datetime.now(TZ).isoformat(),
                 },
             )
 
@@ -1352,471 +1255,6 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                 ),
             }
 
-    # --------------------------------------------------------------
-    # STOP_SUBMITTING -> recover or create stop-loss GTT.
-    # --------------------------------------------------------------
-
-    if request.get("status") == "STOP_SUBMITTING":
-        stop_reference = request.get("stopLossReference")
-
-        if not stop_reference:
-            safe_mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTING",
-                new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                extra={
-                    "executionError": (
-                        "STOP_SUBMITTING state has no stop-loss reference."
-                    ),
-                    "executionAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            return {
-                "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                "symbol": request["symbol"],
-                "quantity": request["quantity"],
-                "message": (
-                    "Stop-loss state is incomplete. "
-                    "Manual action is required."
-                ),
-            }
-
-        existing_stop = find_gtt_with_retries(
-            groww,
-            stop_reference,
-        )
-
-        if existing_stop:
-            stop_order_id = extract_value(
-                existing_stop,
-                "smart_order_id",
-                "smartOrderId",
-                "smart_order_internal_id",
-                "smartOrderInternalId",
-                "id",
-            )
-
-            if stop_order_id:
-                mark_state(
-                    user_id=user_id,
-                    expected_status="STOP_SUBMITTING",
-                    new_status="STOP_SUBMITTED",
-                    extra={
-                        "stopLossId": stop_order_id,
-                        "stopLossRecoveredAt": datetime.now(TZ).isoformat(),
-                    },
-                )
-
-                request = load_request(user_id)
-
-            else:
-                safe_mark_state(
-                    user_id=user_id,
-                    expected_status="STOP_SUBMITTING",
-                    new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                    extra={
-                        "executionError": (
-                            "Existing stop-loss GTT reference was found "
-                            "but its internal ID could not be resolved."
-                        ),
-                        "executionAt": datetime.now(TZ).isoformat(),
-                    },
-                )
-
-                return {
-                    "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                    "symbol": request["symbol"],
-                    "quantity": request["quantity"],
-                    "message": (
-                        "Stop-loss GTT was found but could not be "
-                        "safely resolved. Manual action is required."
-                    ),
-                }
-
-        else:
-            stop_trigger_price = float(
-                request["stopLossPrice"]
-            )
-
-            instrument = groww.get_instrument(request["symbol"])
-
-            try:
-                tick_size = float(instrument["tick_size"])
-            except (KeyError, TypeError, ValueError):
-                return {
-                    "status": "VALIDATION_FAILED",
-                    "symbol": request["symbol"],
-                    "quantity": int(request["quantity"]),
-                    "message": (
-                        f"Could not determine tick size for "
-                        f"{request['symbol']}."
-                    ),
-                }
-
-            if tick_size <= 0:
-                return {
-                    "status": "VALIDATION_FAILED",
-                    "symbol": request["symbol"],
-                    "quantity": int(request["quantity"]),
-                    "message": (
-                        f"Invalid tick size for {request['symbol']}: "
-                        f"{tick_size}"
-                    ),
-                }
-
-            stop_trigger_price = round_down_to_tick(
-                stop_trigger_price,
-                tick_size,
-            )
-
-            stop_limit_price = calculate_stop_loss_limit(
-                stop_trigger_price,
-                tick_size,
-            )
-
-            # Persist the corrected limit price so subsequent recovery
-            # attempts use the same value.
-            mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTING",
-                new_status="STOP_SUBMITTING",
-                extra={
-                    "stopLossLimitPrice": stop_limit_price,
-                },
-            )
-
-            request = load_request(user_id)
-
-            if not request:
-                return {
-                    "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
-                    "symbol": request.get("symbol") if request else None,
-                    "quantity": request.get("quantity") if request else None,
-                    "message": (
-                        "Execution request disappeared during "
-                        "stop-loss recovery."
-                    ),
-                }
-
-            logger.info(
-                "Creating SELL STOP GTT: symbol=%s quantity=%s "
-                "trigger=%s limit=%s reference=%s",
-                request["symbol"],
-                request["quantity"],
-                stop_trigger_price,
-                stop_limit_price,
-                stop_reference,
-            )
-
-            try:
-                stop_response = groww.create_sell_stop_gtt(
-                    trading_symbol=request["symbol"],
-                    quantity=int(request["quantity"]),
-                    trigger_price=stop_trigger_price,
-                    stop_price=stop_limit_price,
-                    reference_id=stop_reference,
-                )
-
-                mark_state(
-                    user_id=user_id,
-                    expected_status="STOP_SUBMITTING",
-                    new_status="STOP_SUBMITTED",
-                    extra={
-                        "stopLossStatus": "SUBMITTED",
-                        "stopLossCreateException": False,
-                        "stopLossResponse": stop_response,
-                        "stopSubmittedAt": datetime.now(TZ).isoformat(),
-                    },
-                )
-
-                request = load_request(user_id)
-
-            except Exception as exc:
-                error_text = str(exc)
-                groww_error_code = getattr(exc, "code", None)
-                groww_error_message = getattr(exc, "msg", None)
-
-                logger.error(
-                    "Stop-loss GTT failed: type=%s code=%s msg=%s error=%s",
-                    type(exc).__name__,
-                    groww_error_code,
-                    groww_error_message,
-                    error_text,
-                )
-                # Groww uses reference_id as an idempotency key.
-                # A duplicate reference means we must NOT create another
-                # stop order with a different reference.
-                if "Duplicate smart order" in error_text or "duplicate" in error_text.lower():
-                    mark_state(
-                        user_id=user_id,
-                        expected_status="STOP_SUBMITTING",
-                        new_status="STOP_PENDING",
-                        extra={
-                            "stopLossStatus": "PENDING_VERIFICATION",
-                            "stopLossCreateException": True,
-                            "stopLossDuplicateReference": True,
-                            "stopLossDuplicateError": error_text,
-                            "stopPendingAt": datetime.now(TZ).isoformat(),
-                        },
-                    )
-
-                    return {
-                        "status": "STOP_PENDING",
-                        "executionStatus": "TARGET_GTT_ACTIVE",
-                        "symbol": request["symbol"],
-                        "quantity": int(request["quantity"]),
-                        "message": (
-                            "Target GTT is active. Groww reported the stop-loss "
-                            "reference as already existing. No duplicate stop "
-                            "was created. Manual verification is required."
-                        ),
-                    }
-
-                mark_state(
-                    user_id=user_id,
-                    expected_status="STOP_SUBMITTING",
-                    new_status="STOP_PENDING",
-                    extra={
-                        "stopLossStatus": "PENDING_VERIFICATION",
-                        "stopLossCreateException": True,
-                        "stopLossCreateError": error_text,
-                        "growwErrorCode": str(groww_error_code) if groww_error_code else None,
-                        "growwErrorMessage": groww_error_message,
-                        "stopPendingAt": datetime.now(TZ).isoformat(),
-                    },
-                )
-
-                return {
-                    "status": "STOP_PENDING",
-                    "executionStatus": "TARGET_GTT_ACTIVE",
-                    "symbol": request["symbol"],
-                    "quantity": int(request["quantity"]),
-                    "message": (
-                        "Stop-loss creation could not be confirmed. "
-                        "Automatic retry is blocked."
-                    ),
-                }
-
-            stop_order_id = extract_value(
-                stop_response,
-                "smart_order_id",
-                "smartOrderId",
-                "smart_order_internal_id",
-                "smartOrderInternalId",
-                "id",
-            )
-
-            if not stop_order_id:
-                recovered_stop = find_gtt_with_retries(
-                    groww,
-                    stop_reference,
-                )
-
-                stop_order_id = extract_value(
-                    recovered_stop,
-                    "smart_order_id",
-                    "smartOrderId",
-                    "smart_order_internal_id",
-                    "smartOrderInternalId",
-                    "id",
-                )
-
-            if not stop_order_id:
-                safe_mark_state(
-                    user_id=user_id,
-                    expected_status="STOP_SUBMITTING",
-                    new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                    extra={
-                        "executionError": (
-                            "Groww stop-loss GTT response did not expose "
-                            "a smart-order ID and the saved reference "
-                            "could not be resolved."
-                        ),
-                        "executionAt": datetime.now(TZ).isoformat(),
-                        "stopLossResponse": json_safe(stop_response),
-                    },
-                )
-
-                return {
-                    "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                    "symbol": request["symbol"],
-                    "quantity": request["quantity"],
-                    "message": (
-                        "Stop-loss SELL GTT could not be confirmed safely. "
-                        "Manual action is required."
-                    ),
-                }
-
-            mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTING",
-                new_status="STOP_SUBMITTED",
-                extra={
-                    "stopLossId": stop_order_id,
-                    "stopLossStatus": "SUBMITTED",
-                    "stopLossSubmittedAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            request = load_request(user_id)
-
-    # --------------------------------------------------------------
-    # STOP_SUBMITTED -> verify stop-loss GTT ACTIVE.
-    # --------------------------------------------------------------
-
-    if request.get("status") == "STOP_SUBMITTED":
-        stop_order_id = request.get("stopLossId")
-
-        if not stop_order_id:
-            safe_mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTED",
-                new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                extra={
-                    "executionError": (
-                        "STOP_SUBMITTED state has no stop-loss "
-                        "smart-order ID."
-                    ),
-                    "executionAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            return {
-                "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                "symbol": request["symbol"],
-                "quantity": request["quantity"],
-                "message": (
-                    "Stop-loss state is incomplete. "
-                    "Manual action is required."
-                ),
-            }
-
-        stop_order_detail = groww.get_smart_order(
-            stop_order_id
-        )
-
-        stop_status = get_gtt_status(
-            stop_order_detail
-        )
-
-        logger.info(
-            "Stop-loss GTT result: id=%s status=%s",
-            stop_order_id,
-            stop_status,
-        )
-
-        if stop_status == "ACTIVE":
-            mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTED",
-                new_status="ORDER_PLACED",
-                extra={
-                    "buyStatus": "EXECUTED",
-                    "gttCreated": True,
-                    "gttStatus": "ACTIVE",
-                    "stopLossStatus": "ACTIVE",
-                    "orderPlaced": True,
-                    "executionStatus": "PROTECTED_POSITION",
-                    "executionAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            request = load_request(user_id)
-
-        elif stop_status in TERMINAL_GTT_FAILURES:
-            safe_mark_state(
-                user_id=user_id,
-                expected_status="STOP_SUBMITTED",
-                new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                extra={
-                    "stopLossStatus": stop_status,
-                    "executionError": (
-                        f"Stop-loss GTT entered terminal status "
-                        f"{stop_status}. Position is NOT fully protected."
-                    ),
-                    "orderPlaced": True,
-                    "gttCreated": True,
-                    "executionAt": datetime.now(TZ).isoformat(),
-                },
-            )
-
-            return {
-                "status": "GTT_FAILED_MANUAL_ACTION_REQUIRED",
-                "symbol": request["symbol"],
-                "quantity": request["quantity"],
-                "buy_average_price": request.get(
-                    "buyAveragePrice"
-                ),
-                "stop_loss_price": request.get(
-                    "stopLossPrice"
-                ),
-                "stop_loss_status": stop_status,
-                "message": (
-                    "Target GTT is active, but the stop-loss GTT is "
-                    "not ACTIVE. Manual action is required."
-                ),
-            }
-
-        else:
-            return {
-                "status": "STOP_PENDING",
-                "symbol": request["symbol"],
-                "quantity": request["quantity"],
-                "stop_loss_status": stop_status,
-                "message": (
-                    "Stop-loss GTT has been submitted but is not yet "
-                    "confirmed ACTIVE. No second stop-loss GTT will be created."
-                ),
-            }
-
-    # --------------------------------------------------------------
-    # ORDER_PLACED -> both target and stop are active.
-    # --------------------------------------------------------------
-
-    if request.get("status") == "ORDER_PLACED":
-        return {
-            "status": "ORDER_PLACED",
-            "symbol": request["symbol"],
-            "quantity": int(request["quantity"]),
-            "coach_entry_price": float(
-                request["coachEntryPrice"]
-            ),
-            "profit_percent": float(
-                get_parameter(
-                    os.environ.get(
-                        "PROFIT_PARAMETER_NAME",
-                        "/coach-trading/profit-percent",
-                    )
-                )
-            ),
-            "gtt_target_price": float(
-                request["gttTargetPrice"]
-            ),
-            "buy_order_id": request.get("buyOrderId"),
-            "buy_average_price": request.get("buyAveragePrice"),
-            "gtt_id": request.get("gttId"),
-            "gtt_status": request.get("gttStatus"),
-            "stop_loss_percent": request.get("stopLossPercent"),
-            "stop_loss_price": request.get("stopLossPrice"),
-            "stop_loss_limit_price": request.get(
-                "stopLossLimitPrice"
-            ),
-            "stop_loss_reference": request.get(
-                "stopLossReference"
-            ),
-            "stop_loss_id": request.get("stopLossId"),
-            "stop_loss_status": request.get(
-                "stopLossStatus"
-            ),
-            "execution_status": request.get(
-                "executionStatus",
-                "PROTECTED_POSITION",
-            ),
-            "order_placed": True,
-            "gtt_created": True,
-        }
-
     return {
         "status": request.get("status"),
         "symbol": request.get("symbol"),
@@ -1827,11 +1265,11 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
 def execute_request(*, user_id, request):
     status = request.get("status")
+
     trading_enabled = (
-        os.environ.get(
-            "TRADING_ENABLED",
-            "false",
-        ).strip().lower()
+        get_parameter("/coach-trading/trading-enabled", default="false")
+        .strip()
+        .lower()
         == "true"
     )
 
@@ -1896,7 +1334,6 @@ def execute_request(*, user_id, request):
         "BUY_EXECUTED",
         "GTT_SUBMITTING",
         "GTT_SUBMITTED",
-        "STOP_SUBMITTED",
     }:
         return continue_buy_and_gtt(
             user_id=user_id,
@@ -2036,7 +1473,6 @@ def lambda_handler(event, context):
         if status in {
             "BUY_PENDING",
             "GTT_PENDING",
-            "STOP_PENDING",
             "ALREADY_PROCESSING",
         }:
             return {
