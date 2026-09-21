@@ -271,7 +271,7 @@ def find_executable_requests():
 
     filter_expression = (
         "#sk = :pending AND "
-        "#status IN (:s1, :s2, :s3, :s4, :s5, :s6, :s7)"
+        "#status IN (:s1, :s2, :s3, :s4, :s5, :s6)"
     )
 
     expression_attribute_names = {
