@@ -1275,11 +1275,10 @@ def execute_request(*, user_id, request):
 
     groww = None
 
-    if trading_enabled:
+    if status != "CONFIRMED_BUT_NOT_EXECUTED" and trading_enabled:
         groww_credentials = get_secret(
             os.environ["GROWW_SECRET_ARN"]
         )
-
         groww = GrowwClient(groww_credentials)
 
     if status == "CONFIRMED_BUT_NOT_EXECUTED":
