@@ -255,6 +255,17 @@ def execution_message(result):
             "No second BUY will be submitted automatically."
         )
 
+    if status == "TARGET_GTT_ACTIVE":
+        return (
+            "TRADE EXECUTED SUCCESSFULLY.\n\n"
+            f"Symbol: {symbol}\n"
+            f"Quantity: {quantity}\n"
+            f"BUY average price: ₹{result.get('buy_average_price', '-')}\n"
+            f"SELL target: ₹{result.get('gtt_target_price', '-')}\n"
+            "SELL target GTT is ACTIVE.\n\n"
+            "No further action is required."
+        )
+
     if status == "GTT_PENDING":
         return (
             "BUY IS EXECUTED; SELL GTT IS PENDING.\n\n"
