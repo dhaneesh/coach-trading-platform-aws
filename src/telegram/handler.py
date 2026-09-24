@@ -164,7 +164,7 @@ def archive_completed_request(user_id, request):
     return True
 
 
-def prepare_pending_buy_slot(user_id, chat_id):
+def prepare_pending_buy_slot(user_id, chat_id, requested_symbol):
     existing = table().get_item(
         Key={"PK": f"USER#{user_id}", "SK": "PENDING_BUY"}
     ).get("Item")
@@ -175,6 +175,12 @@ def prepare_pending_buy_slot(user_id, chat_id):
     status = str(existing.get("status", "")).upper()
 
     if status in BLOCKING_STATUSES:
+        existing_symbol = str(existing.get("symbol", "")).upper()
+        requested_symbol = str(requested_symbol).upper()
+
+        if existing_symbol != requested_symbol:
+            return True
+
         send(
             chat_id,
             (
@@ -355,7 +361,7 @@ def handle_buy(user_id, chat_id, args):
     now = datetime.now(TZ).isoformat()
 
     # Do not overwrite an existing PENDING_BUY request.
-    if not prepare_pending_buy_slot(user_id, chat_id):
+    if not prepare_pending_buy_slot(user_id, chat_id, symbol):
         return
 
     table().put_item(
