@@ -1204,7 +1204,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     "buyStatus": "EXECUTED",
                     "gttStatus": gtt_status,
                     "gttCreated": True,
-                    "orderPlaced": False,
+                    "orderPlaced": True,
                     "executionStatus": "TARGET_GTT_ACTIVE",
                     "executionAt": datetime.now(TZ).isoformat(),
                 },
