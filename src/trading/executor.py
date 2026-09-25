@@ -185,6 +185,7 @@ def decimal_value(value):
 def mark_state(
     *,
     user_id,
+    request_sk="PENDING_BUY",
     expected_status,
     new_status,
     extra=None,
@@ -216,7 +217,7 @@ def mark_state(
     table().update_item(
         Key={
             "PK": f"USER#{user_id}",
-            "SK": "PENDING_BUY",
+            "SK": request_sk,
         },
         UpdateExpression="SET " + ", ".join(assignments),
         ConditionExpression="#s = :expected",
@@ -228,6 +229,7 @@ def mark_state(
 def safe_mark_state(
     *,
     user_id,
+    request_sk="PENDING_BUY",
     expected_status,
     new_status,
     extra=None,
@@ -235,6 +237,7 @@ def safe_mark_state(
     try:
         mark_state(
             user_id=user_id,
+            request_sk=request_sk,
             expected_status=expected_status,
             new_status=new_status,
             extra=extra,
@@ -250,15 +253,47 @@ def safe_mark_state(
         raise
 
 
-def load_request(user_id):
-    response = table().get_item(
+def load_request(user_id, request_sk=None):
+    if request_sk:
+        response = table().get_item(
+            Key={
+                "PK": f"USER#{user_id}",
+                "SK": request_sk,
+            }
+        )
+        return response.get("Item")
+
+    response = table().scan(
+        FilterExpression=(
+            "#pk = :pk AND begins_with(#sk, :prefix)"
+        ),
+        ExpressionAttributeNames={
+            "#pk": "PK",
+            "#sk": "SK",
+        },
+        ExpressionAttributeValues={
+            ":pk": f"USER#{user_id}",
+            ":prefix": "PENDING_BUY#",
+        },
+    )
+
+    items = response.get("Items", [])
+    items.sort(key=lambda item: str(item.get("createdAt", "")))
+
+    if items:
+        return items[0]
+
+    # Backward compatibility for the existing single-slot request.
+    # This is intentionally read-only; new requests must use
+    # PENDING_BUY#<SYMBOL>.
+    legacy = table().get_item(
         Key={
             "PK": f"USER#{user_id}",
             "SK": "PENDING_BUY",
         }
-    )
+    ).get("Item")
 
-    return response.get("Item")
+    return legacy
 
 
 def dry_run_execution(*, symbol, quantity, entry_label, entry_price,
@@ -428,6 +463,7 @@ def execute_new_buy(*, user_id, request):
     if not funds["sufficient"]:
         safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="CONFIRMED_BUT_NOT_EXECUTED",
             new_status="INSUFFICIENT_FUNDS",
             extra={
@@ -460,6 +496,7 @@ def execute_new_buy(*, user_id, request):
 
     claimed = safe_mark_state(
         user_id=user_id,
+        request_sk=request["SK"],
         expected_status="CONFIRMED_BUT_NOT_EXECUTED",
         new_status="BUY_SUBMITTING",
         extra={
@@ -507,6 +544,7 @@ def execute_new_buy(*, user_id, request):
     if not groww_order_id:
         safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="BUY_SUBMITTING",
             new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
             extra={
@@ -532,6 +570,7 @@ def execute_new_buy(*, user_id, request):
 
     mark_state(
         user_id=user_id,
+        request_sk=request["SK"],
         expected_status="BUY_SUBMITTING",
         new_status="BUY_SUBMITTED",
         extra={
@@ -540,7 +579,7 @@ def execute_new_buy(*, user_id, request):
         },
     )
 
-    request = load_request(user_id)
+    request = load_request(user_id, request["SK"])
 
     return continue_buy_and_gtt(
         user_id=user_id,
@@ -555,6 +594,7 @@ def recover_buy_submission(*, user_id, request, groww):
     if not reference:
         safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="BUY_SUBMITTING",
             new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
             extra={
@@ -613,6 +653,7 @@ def recover_buy_submission(*, user_id, request, groww):
     if not groww_order_id:
         safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="BUY_SUBMITTING",
             new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
             extra={
@@ -653,6 +694,7 @@ def recover_buy_submission(*, user_id, request, groww):
 
     claimed = safe_mark_state(
         user_id=user_id,
+        request_sk=request["SK"],
         expected_status="BUY_SUBMITTING",
         new_status="BUY_SUBMITTED",
         extra={
@@ -665,7 +707,7 @@ def recover_buy_submission(*, user_id, request, groww):
     )
 
     if not claimed:
-        current = load_request(user_id)
+        current = load_request(user_id, request["SK"])
         if current:
             return continue_buy_and_gtt(
                 user_id=user_id,
@@ -673,7 +715,7 @@ def recover_buy_submission(*, user_id, request, groww):
                 groww=groww,
             )
 
-    request = load_request(user_id)
+    request = load_request(user_id, request["SK"])
     if not request:
         return {
             "status": "EXECUTION_UNKNOWN_MANUAL_REVIEW",
@@ -733,6 +775,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="BUY_EXECUTED",
                 new_status="GTT_SUBMITTED",
                 extra={
@@ -769,6 +812,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
         if not groww_order_id:
             safe_mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="BUY_SUBMITTED",
                 new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
                 extra={
@@ -811,6 +855,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
             if average_fill_price is None:
                 safe_mark_state(
                     user_id=user_id,
+                    request_sk=request["SK"],
                     expected_status="BUY_SUBMITTED",
                     new_status="EXECUTION_UNKNOWN_MANUAL_REVIEW",
                     extra={
@@ -881,6 +926,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="BUY_SUBMITTED",
                 new_status="BUY_EXECUTED",
                 extra={
@@ -892,11 +938,12 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                 },
             )
 
-            request = load_request(user_id)
+            request = load_request(user_id, request["SK"])
 
         elif buy_status in TERMINAL_BUY_FAILURES:
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="BUY_SUBMITTED",
                 new_status="BUY_REJECTED",
                 extra={
@@ -941,6 +988,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
         claimed = safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="BUY_EXECUTED",
             new_status="GTT_SUBMITTING",
             extra={
@@ -950,9 +998,9 @@ def continue_buy_and_gtt(*, user_id, request, groww):
         )
 
         if not claimed:
-            request = load_request(user_id)
+            request = load_request(user_id, request["SK"])
         else:
-            request = load_request(user_id)
+            request = load_request(user_id, request["SK"])
 
     # --------------------------------------------------------------
     # GTT_SUBMITTING -> recover or create target GTT.
@@ -964,6 +1012,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
         if not gtt_reference:
             safe_mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="GTT_SUBMITTING",
                 new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                 extra={
@@ -1002,6 +1051,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
             if smart_order_id:
                 mark_state(
                     user_id=user_id,
+                    request_sk=request["SK"],
                     expected_status="GTT_SUBMITTING",
                     new_status="GTT_SUBMITTED",
                     extra={
@@ -1010,11 +1060,12 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                     },
                 )
 
-                request = load_request(user_id)
+                request = load_request(user_id, request["SK"])
 
             else:
                 safe_mark_state(
                     user_id=user_id,
+                    request_sk=request["SK"],
                     expected_status="GTT_SUBMITTING",
                     new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                     extra={
@@ -1066,6 +1117,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
                 safe_mark_state(
                     user_id=user_id,
+                    request_sk=request["SK"],
                     expected_status="GTT_SUBMITTING",
                     new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                     extra={
@@ -1117,6 +1169,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
             if not smart_order_id:
                 safe_mark_state(
                     user_id=user_id,
+                    request_sk=request["SK"],
                     expected_status="GTT_SUBMITTING",
                     new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                     extra={
@@ -1142,6 +1195,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
 
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="GTT_SUBMITTING",
                 new_status="GTT_SUBMITTED",
                 extra={
@@ -1151,7 +1205,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                 },
             )
 
-            request = load_request(user_id)
+            request = load_request(user_id, request["SK"])
 
     # --------------------------------------------------------------
     # GTT_SUBMITTED -> verify target GTT ACTIVE.
@@ -1163,6 +1217,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
         if not smart_order_id:
             safe_mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="GTT_SUBMITTED",
                 new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                 extra={
@@ -1198,6 +1253,7 @@ def continue_buy_and_gtt(*, user_id, request, groww):
         if gtt_status == "ACTIVE":
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="GTT_SUBMITTED",
                 new_status="TARGET_GTT_ACTIVE",
                 extra={
@@ -1210,11 +1266,12 @@ def continue_buy_and_gtt(*, user_id, request, groww):
                 },
             )
 
-            request = load_request(user_id)
+            request = load_request(user_id, request["SK"])
 
         elif gtt_status in TERMINAL_GTT_FAILURES:
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="GTT_SUBMITTED",
                 new_status="GTT_FAILED_MANUAL_ACTION_REQUIRED",
                 extra={
@@ -1300,7 +1357,10 @@ def execute_request(*, user_id, request):
         }:
             return result
 
-        current = load_request(user_id)
+        current = load_request(
+            user_id,
+            request.get("SK"),
+        )
 
         if not current:
             return {
@@ -1397,7 +1457,21 @@ def lambda_handler(event, context):
         }
 
     try:
-        request = load_request(user_id)
+        request_sk = str(event.get("request_sk", "")).strip()
+
+        if not request_sk:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({
+                    "status": "validation_error",
+                    "message": "request_sk is required",
+                }),
+            }
+
+        request = load_request(
+            user_id=user_id,
+            request_sk=request_sk,
+        )
 
         if not request:
             return {
@@ -1429,6 +1503,7 @@ def lambda_handler(event, context):
         if status == "DRY_RUN":
             mark_state(
                 user_id=user_id,
+                request_sk=request["SK"],
                 expected_status="CONFIRMED_BUT_NOT_EXECUTED",
                 new_status="DRY_RUN_EXECUTED",
                 extra={
@@ -1549,6 +1624,7 @@ def lambda_handler(event, context):
         # validation itself has failed.
         safe_mark_state(
             user_id=user_id,
+            request_sk=request["SK"],
             expected_status="CONFIRMED_BUT_NOT_EXECUTED",
             new_status="VALIDATION_FAILED",
             extra={

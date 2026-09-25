@@ -270,7 +270,7 @@ def find_executable_requests():
     found = []
 
     filter_expression = (
-        "#sk = :pending AND "
+        "begins_with(#sk, :pending_prefix) AND "
         "#status IN (:s1, :s2, :s3, :s4, :s5, :s6)"
     )
 
@@ -280,7 +280,7 @@ def find_executable_requests():
     }
 
     expression_attribute_values = {
-        ":pending": "PENDING_BUY",
+        ":pending_prefix": "PENDING_BUY#",
         ":s1": "CONFIRMED_BUT_NOT_EXECUTED",
         ":s2": "BUY_SUBMITTING",
         ":s3": "BUY_SUBMITTED",

@@ -97,7 +97,7 @@ def find_active_signal(symbol, entry):
 
     return None
 
-# Completed requests are archived before the single active-request slot is reused.
+# Completed requests are archived before the same symbol request key is reused.
 ARCHIVABLE_STATUSES = {
     "ORDER_PLACED",
     "DRY_RUN_EXECUTED",
@@ -144,7 +144,10 @@ def archive_completed_request(user_id, request):
 
     try:
         table().delete_item(
-            Key={"PK": f"USER#{user_id}", "SK": "PENDING_BUY"},
+            Key={
+                "PK": f"USER#{user_id}",
+                "SK": request["SK"],
+            },
             ConditionExpression="#s = :status",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={":status": status},
@@ -152,7 +155,7 @@ def archive_completed_request(user_id, request):
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
             logger.warning(
-                "PENDING_BUY changed while archiving; archive=%s", archive_key
+                "BUY request changed while archiving; archive=%s", archive_key
             )
             return False
         raise
@@ -163,11 +166,105 @@ def archive_completed_request(user_id, request):
     )
     return True
 
+def pending_buy_sk(symbol):
+    return f"PENDING_BUY#{normalize_symbol(symbol)}"
+
+
+def find_pending_buy_requests(user_id, status=None, symbol=None):
+    """
+    Return all pending BUY requests for a user.
+
+    New requests use PENDING_BUY#SYMBOL. The legacy PENDING_BUY key is
+    also checked so the existing APOLLOTYRE request is not ignored during
+    the migration.
+    """
+    requested_symbol = normalize_symbol(symbol) if symbol else None
+    items = []
+
+    filter_expression = (
+        "begins_with(#sk, :prefix) AND #pk = :pk"
+        + (" AND #status = :status" if status else "")
+    )
+    expression_attribute_names = {
+        "#pk": "PK",
+        "#sk": "SK",
+        **({"#status": "status"} if status else {}),
+    }
+    expression_attribute_values = {
+        ":pk": f"USER#{user_id}",
+        ":prefix": "PENDING_BUY#",
+        **({":status": status} if status else {}),
+    }
+
+    response = table().scan(
+        FilterExpression=filter_expression,
+        ExpressionAttributeNames=expression_attribute_names,
+        ExpressionAttributeValues=expression_attribute_values,
+    )
+    items.extend(response.get("Items", []))
+
+    while "LastEvaluatedKey" in response:
+        response = table().scan(
+            ExclusiveStartKey=response["LastEvaluatedKey"],
+            FilterExpression=filter_expression,
+            ExpressionAttributeNames=expression_attribute_names,
+            ExpressionAttributeValues=expression_attribute_values,
+        )
+        items.extend(response.get("Items", []))
+
+    # Backward compatibility for the existing legacy request.
+    legacy = table().get_item(
+        Key={
+            "PK": f"USER#{user_id}",
+            "SK": "PENDING_BUY",
+        }
+    ).get("Item")
+
+    if legacy:
+        if status is None or str(legacy.get("status", "")).upper() == str(status).upper():
+            items.append(legacy)
+
+    # Remove duplicate records by DynamoDB primary key.
+    unique = {}
+    for item in items:
+        unique[(item.get("PK"), item.get("SK"))] = item
+    items = list(unique.values())
+
+    if requested_symbol:
+        items = [
+            item
+            for item in items
+            if normalize_symbol(item.get("symbol", "")) == requested_symbol
+        ]
+
+    items.sort(key=lambda item: str(item.get("createdAt", "")))
+    return items
+
+
+def find_pending_buy_request(user_id, status=None, symbol=None):
+    """Return the oldest matching pending BUY request."""
+    items = find_pending_buy_requests(
+        user_id=user_id,
+        status=status,
+        symbol=symbol,
+    )
+    return items[0] if items else None
+
 
 def prepare_pending_buy_slot(user_id, chat_id, requested_symbol):
-    existing = table().get_item(
-        Key={"PK": f"USER#{user_id}", "SK": "PENDING_BUY"}
-    ).get("Item")
+    """
+    Allow different symbols to have independent pending BUY requests.
+
+    A second request for the SAME symbol is blocked while its existing
+    request is active, awaiting confirmation, or requires manual review.
+    """
+    requested_symbol = normalize_symbol(requested_symbol)
+
+    # Only inspect the requested symbol. Different symbols can coexist.
+    existing = find_pending_buy_request(
+        user_id=user_id,
+        symbol=requested_symbol,
+    )
 
     if not existing:
         return True
@@ -175,36 +272,56 @@ def prepare_pending_buy_slot(user_id, chat_id, requested_symbol):
     status = str(existing.get("status", "")).upper()
 
     if status in BLOCKING_STATUSES:
-        existing_symbol = str(existing.get("symbol", "")).upper()
-        requested_symbol = str(requested_symbol).upper()
-
-        if existing_symbol != requested_symbol:
-            return True
-
         send(
             chat_id,
             (
-                "A BUY request is already active or needs manual review.\n\n"
-                f"Symbol: {existing.get('symbol', '-')}\n"
+                "A BUY request for this symbol is already active or needs "
+                "manual review.\n\n"
+                f"Symbol: {existing.get('symbol', requested_symbol)}\n"
                 f"Quantity: {existing.get('quantity', '-')}\n"
                 f"Status: {status}\n\n"
-                "Complete or cancel that request before starting another BUY."
+                "Complete or cancel that request before starting another BUY "
+                "for the same symbol."
+            ),
+        )
+        return False
+
+    if status == "PENDING_CONFIRMATION":
+        send(
+            chat_id,
+            (
+                "A BUY request for this symbol is already waiting for "
+                "confirmation.\n\n"
+                f"Symbol: {existing.get('symbol', requested_symbol)}\n"
+                f"Quantity: {existing.get('quantity', '-')}\n\n"
+                "Reply CONFIRM or CANCEL before creating another request "
+                "for the same symbol."
             ),
         )
         return False
 
     if status in ARCHIVABLE_STATUSES:
-        return archive_completed_request(user_id, existing)
+        if archive_completed_request(user_id, existing):
+            return True
+
+        send(
+            chat_id,
+            "The previous BUY request could not be archived safely. "
+            "No new request was created.",
+        )
+        return False
 
     send(
         chat_id,
         (
-            "A previous BUY request has an unrecognized status and is blocked "
-            "for safety.\n\n"
-            f"Status: {status}"
+            "A BUY request for this symbol is already present with an "
+            f"unrecognized status: {status or 'UNKNOWN'}.\n\n"
+            f"Symbol: {existing.get('symbol', requested_symbol)}\n"
+            "No new BUY request was created."
         ),
     )
     return False
+
 
 def execution_message(result):
     status = str(result.get("status", "")).upper()
@@ -360,14 +477,14 @@ def handle_buy(user_id, chat_id, args):
 
     now = datetime.now(TZ).isoformat()
 
-    # Do not overwrite an existing PENDING_BUY request.
+    # Do not overwrite an existing request for the same symbol.
     if not prepare_pending_buy_slot(user_id, chat_id, symbol):
         return
 
     table().put_item(
         Item={
             "PK": f"USER#{user_id}",
-            "SK": "PENDING_BUY",
+            "SK": pending_buy_sk(symbol),
             "status": "PENDING_CONFIRMATION",
             "symbol": normalize_symbol(symbol),
             "quantity": quantity,
@@ -403,15 +520,24 @@ def handle_buy(user_id, chat_id, args):
 
 
 def handle_confirm(user_id, chat_id):
+    existing = find_pending_buy_request(
+        user_id,
+        status="PENDING_CONFIRMATION",
+    )
+
+    if not existing:
+        send(chat_id, "There is no BUY request waiting for confirmation.")
+        return
+
+    request_sk = existing["SK"]
+
     try:
         table().update_item(
             Key={
                 "PK": f"USER#{user_id}",
-                "SK": "PENDING_BUY",
+                "SK": request_sk,
             },
-            UpdateExpression=(
-                "SET #s = :confirmed, confirmedAt = :t"
-            ),
+            UpdateExpression="SET #s = :confirmed, confirmedAt = :t",
             ConditionExpression="#s = :pending",
             ExpressionAttributeNames={"#s": "status"},
             ExpressionAttributeValues={
@@ -420,42 +546,25 @@ def handle_confirm(user_id, chat_id):
                 ":t": datetime.now(TZ).isoformat(),
             },
         )
+
     except ClientError as exc:
         if exc.response["Error"]["Code"] != (
             "ConditionalCheckFailedException"
         ):
             raise
 
-        existing = table().get_item(
-            Key={
-                "PK": f"USER#{user_id}",
-                "SK": "PENDING_BUY",
-            }
-        ).get("Item")
-
-        if not existing:
-            send(chat_id, "There is no pending BUY request.")
-            return
-
-        status = existing.get("status")
-        if status == "PENDING_CONFIRMATION":
-            send(chat_id, "BUY confirmation is already being processed.")
-            return
-
         send(
             chat_id,
-            (
-                "This BUY request has already been processed.\n"
-                f"Symbol: {existing.get('symbol', '-')}\n"
-                f"Quantity: {existing.get('quantity', '-')}\n"
-                f"Status: {status}"
-            ),
+            "This BUY request has already been processed.",
         )
         return
 
     logger.info(
-        "BUY confirmed and queued for EC2 trading worker: user_id=%s",
+        "BUY confirmed and queued for EC2 trading worker: "
+        "user_id=%s symbol=%s sk=%s",
         user_id,
+        existing.get("symbol"),
+        request_sk,
     )
 
     send(
@@ -466,25 +575,47 @@ def handle_confirm(user_id, chat_id):
         ),
     )
 
-
 def handle_cancel(user_id, chat_id):
+    existing = find_pending_buy_request(
+        user_id,
+        status="PENDING_CONFIRMATION",
+    )
+
+    if not existing:
+        send(chat_id, "There is no pending BUY request to cancel.")
+        return
+
     try:
         table().delete_item(
             Key={
-                "PK": f"USER#{user_id}",
-                "SK": "PENDING_BUY",
+                "PK": existing["PK"],
+                "SK": existing["SK"],
             },
-            ConditionExpression="attribute_exists(PK)",
+            ConditionExpression="#s = :pending",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={
+                ":pending": "PENDING_CONFIRMATION",
+            },
         )
-        send(chat_id, "Pending BUY request cancelled.")
+
+        send(
+            chat_id,
+            (
+                "Pending BUY request cancelled.\n"
+                f"Symbol: {existing.get('symbol', '-')}"
+            ),
+        )
+
     except ClientError as exc:
         if exc.response["Error"]["Code"] == (
             "ConditionalCheckFailedException"
         ):
-            send(chat_id, "There is no pending BUY request.")
+            send(
+                chat_id,
+                "The BUY request was already processed.",
+            )
             return
         raise
-
 
 def lambda_handler(event, context):
     try:
