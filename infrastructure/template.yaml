@@ -11,11 +11,11 @@ Globals:
       Variables:
         DYNAMODB_TABLE: !Ref TradingTable
         PROFIT_PARAMETER_NAME: /coach-trading/profit-percent
+        STOP_LOSS_PARAMETER_NAME: /coach-trading/stop-loss-percent
         TELEGRAM_AUTHORIZED_USER_ID: !Ref TelegramAuthorizedUserId
         GROWW_SECRET_ARN: !Ref GrowwSecretArn
         GOOGLE_SECRET_ARN: !Ref GoogleSecretArn
         TELEGRAM_BOT_TOKEN_SECRET_ARN: !Ref TelegramBotTokenSecretArn
-        TRADING_ENABLED: "true"
 
 Parameters:
   TelegramAuthorizedUserId:
@@ -29,13 +29,15 @@ Parameters:
 
   TelegramBotTokenSecretArn:
     Type: String
+  
+  TradingEc2AmiId:
+    Type: AWS::EC2::Image::Id
+    Default: ami-055c6ceed72cc818f
+    Description: Amazon Linux 2023 x86_64 AMI
 
-  TradingEnabled:
+  TradingEc2InstanceType:
     Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
+    Default: t3.micro
 
 Resources:
 
@@ -121,83 +123,16 @@ Resources:
         - Key: Name
           Value: coach-trading-public-subnet
 
-  TradingPrivateSubnet:
-    Type: AWS::EC2::Subnet
-    Properties:
-      VpcId: !Ref TradingVpc
-      CidrBlock: 10.20.2.0/24
-      AvailabilityZone: !Select [0, !GetAZs '']
-      MapPublicIpOnLaunch: false
-      Tags:
-        - Key: Name
-          Value: coach-trading-private-subnet
+  # ------------------------------------------------------------------
+  # EC2 Trading Worker
+  # Temporary parallel path while Trading Lambda/NAT remains active.
+  # EC2 uses its own Elastic IP for direct Groww connectivity.
+  # ------------------------------------------------------------------
 
-  TradingPublicRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref TradingVpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-public-rt
-
-  TradingPublicRoute:
-    Type: AWS::EC2::Route
-    DependsOn: TradingVpcGatewayAttachment
-    Properties:
-      RouteTableId: !Ref TradingPublicRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      GatewayId: !Ref TradingInternetGateway
-
-  TradingPublicSubnetRouteAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref TradingPublicSubnet
-      RouteTableId: !Ref TradingPublicRouteTable
-
-  TradingNatEip:
-    Type: AWS::EC2::EIP
-    DependsOn: TradingVpcGatewayAttachment
-    Properties:
-      Domain: vpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-nat-eip
-
-  TradingNatGateway:
-    Type: AWS::EC2::NatGateway
-    DependsOn: TradingPublicSubnetRouteAssociation
-    Properties:
-      AllocationId: !GetAtt TradingNatEip.AllocationId
-      SubnetId: !Ref TradingPublicSubnet
-      Tags:
-        - Key: Name
-          Value: coach-trading-nat
-
-  TradingPrivateRouteTable:
-    Type: AWS::EC2::RouteTable
-    Properties:
-      VpcId: !Ref TradingVpc
-      Tags:
-        - Key: Name
-          Value: coach-trading-private-rt
-
-  TradingPrivateRoute:
-    Type: AWS::EC2::Route
-    Properties:
-      RouteTableId: !Ref TradingPrivateRouteTable
-      DestinationCidrBlock: 0.0.0.0/0
-      NatGatewayId: !Ref TradingNatGateway
-
-  TradingPrivateSubnetRouteAssociation:
-    Type: AWS::EC2::SubnetRouteTableAssociation
-    Properties:
-      SubnetId: !Ref TradingPrivateSubnet
-      RouteTableId: !Ref TradingPrivateRouteTable
-
-  TradingSecurityGroup:
+  TradingEc2SecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
-      GroupDescription: Outbound HTTPS for Trading Lambda
+      GroupDescription: Outbound HTTPS for EC2 Trading Worker
       VpcId: !Ref TradingVpc
       SecurityGroupEgress:
         - IpProtocol: tcp
@@ -206,7 +141,94 @@ Resources:
           CidrIp: 0.0.0.0/0
       Tags:
         - Key: Name
-          Value: coach-trading-lambda-sg
+          Value: coach-trading-ec2-sg
+
+  TradingEc2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: coach-trading-ec2-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: coach-trading-ec2-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt TradingTable.Arn
+
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref GrowwSecretArn
+                  - !Ref TelegramBotTokenSecretArn
+
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/stop-loss-percent
+
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  TradingEc2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: coach-trading-ec2-instance-profile
+      Roles:
+        - !Ref TradingEc2Role
+
+  TradingEc2Eip:
+    Type: AWS::EC2::EIP
+    DependsOn: TradingVpcGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: coach-trading-ec2-eip
+
+  TradingEc2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref TradingEc2AmiId
+      InstanceType: !Ref TradingEc2InstanceType
+      SubnetId: !Ref TradingPublicSubnet
+      SecurityGroupIds:
+        - !Ref TradingEc2SecurityGroup
+      IamInstanceProfile: !Ref TradingEc2InstanceProfile
+      Monitoring: false
+      Tags:
+        - Key: Name
+          Value: coach-trading-ec2-worker
+
+  TradingEc2EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref TradingEc2Instance
+      AllocationId: !GetAtt TradingEc2Eip.AllocationId
 
   MonitorFunction:
     Type: AWS::Serverless::Function
@@ -222,7 +244,9 @@ Resources:
             Effect: Allow
             Action:
               - ssm:GetParameter
-            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+            Resource:
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
+              - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/stop-loss-percent
         - Statement:
             Effect: Allow
             Action:
@@ -270,9 +294,6 @@ Resources:
     Properties:
       CodeUri: ../src/
       Handler: telegram.handler.lambda_handler
-      Environment:
-        Variables:
-          TRADING_FUNCTION_NAME: !Ref TradingFunction
       Policies:
         - DynamoDBCrudPolicy:
             TableName: !Ref TradingTable
@@ -281,47 +302,12 @@ Resources:
             Action:
               - secretsmanager:GetSecretValue
             Resource: !Ref TelegramBotTokenSecretArn
-        - Statement:
-            Effect: Allow
-            Action:
-              - lambda:InvokeFunction
-            Resource: !GetAtt TradingFunction.Arn
       Events:
         TelegramWebhook:
           Type: HttpApi
           Properties:
             Path: /telegram/webhook
             Method: POST
-
-  TradingFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      CodeUri: ../src/
-      Runtime: python3.12
-      Handler: trading.executor.lambda_handler
-      Layers:
-        - !Ref GrowwDependenciesLayer
-      Timeout: 60
-      VpcConfig:
-        SecurityGroupIds:
-          - !Ref TradingSecurityGroup
-        SubnetIds:
-          - !Ref TradingPrivateSubnet
-      Policies:
-        - DynamoDBCrudPolicy:
-            TableName: !Ref TradingTable
-        - Statement:
-            Effect: Allow
-            Action:
-              - secretsmanager:GetSecretValue
-            Resource: !Ref GrowwSecretArn
-        - Statement:
-            Effect: Allow
-            Action:
-              - ssm:GetParameter
-            Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/coach-trading/profit-percent
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
-
 Outputs:
   ApiEndpoint:
     Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
@@ -331,13 +317,18 @@ Outputs:
 
   GrowwWhitelistIp:
     Description: Static public IPv4 address to whitelist in Groww API settings
-    Value: !Ref TradingNatEip
+    Value: !Ref TradingEc2Eip
 
   TradingVpcId:
     Value: !Ref TradingVpc
 
-  TradingPrivateSubnetId:
-    Value: !Ref TradingPrivateSubnet
+  TradingEc2InstanceId:
+    Value: !Ref TradingEc2Instance
 
-  TradingNatGatewayId:
-    Value: !Ref TradingNatGateway
+  TradingEc2Eip:
+    Description: Static public IPv4 address for EC2 Trading Worker
+    Value: !Ref TradingEc2Eip
+
+  TradingEc2PrivateIp:
+    Description: Private IPv4 address for EC2 Trading Worker
+    Value: !GetAtt TradingEc2Instance.PrivateIp

@@ -36,10 +36,44 @@ class GrowwClient:
             )
 
     def authenticate(self):
-        token = GrowwAPI.get_access_token(
-            api_key=self.totp_token,
-            totp=pyotp.TOTP(self.totp_secret).now(),
+        import requests
+        import uuid
+
+        url = "https://api.groww.in/v1/token/api/access"
+
+        headers = {
+            "x-request-id": str(uuid.uuid4()),
+            "Authorization": "Bearer " + self.totp_token,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-client-id": "growwapi",
+            "x-client-platform": "growwapi-python-client",
+            "x-client-platform-version": "1.5.0",
+            "x-api-version": "1.0",
+        }
+
+        payload = {
+            "key_type": "totp",
+            "totp": pyotp.TOTP(self.totp_secret).now(),
+        }
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=15,
         )
+
+        response.raise_for_status()
+
+        data = response.json()
+        token = data.get("token")
+
+        if not token:
+            raise RuntimeError(
+                "Groww authentication succeeded but no access token was returned"
+            )
+
         self.client = GrowwAPI(token)
 
     @staticmethod
@@ -122,19 +156,17 @@ class GrowwClient:
         quantity,
         order_reference_id,
     ):
-        return self.call_with_reauth(
-            lambda: self.client.place_order(
-                validity=self.client.VALIDITY_DAY,
-                exchange="NSE",
-                order_type=self.client.ORDER_TYPE_MARKET,
-                product="CNC",
-                quantity=quantity,
-                segment=self.client.SEGMENT_CASH,
-                trading_symbol=trading_symbol,
-                transaction_type="BUY",
-                order_reference_id=order_reference_id,
-                price=0.0,
-            )
+        return self.client.place_order(
+            validity=self.client.VALIDITY_DAY,
+            exchange="NSE",
+            order_type=self.client.ORDER_TYPE_MARKET,
+            product="CNC",
+            quantity=quantity,
+            segment=self.client.SEGMENT_CASH,
+            trading_symbol=trading_symbol,
+            transaction_type="BUY",
+            order_reference_id=order_reference_id,
+            price=0.0,
         )
 
     def get_order_detail(self, groww_order_id):
@@ -165,24 +197,22 @@ class GrowwClient:
         trigger_price,
         reference_id,
     ):
-        return self.call_with_reauth(
-            lambda: self.client.create_smart_order(
-                smart_order_type="GTT",
-                segment=self.client.SEGMENT_CASH,
-                trading_symbol=trading_symbol,
-                quantity=quantity,
-                product_type="CNC",
-                exchange="NSE",
-                duration=self.client.VALIDITY_DAY,
-                reference_id=reference_id,
-                trigger_price=str(trigger_price),
-                trigger_direction="UP",
-                order={
-                    "order_type": self.client.ORDER_TYPE_LIMIT,
-                    "price": float(trigger_price),
-                    "transaction_type": "SELL",
-                },
-            )
+        return self.client.create_smart_order(
+            smart_order_type="GTT",
+            segment=self.client.SEGMENT_CASH,
+            trading_symbol=trading_symbol,
+            quantity=quantity,
+            product_type="CNC",
+            exchange="NSE",
+            duration=self.client.VALIDITY_DAY,
+            reference_id=reference_id,
+            trigger_price=str(trigger_price),
+            trigger_direction="UP",
+            order={
+                "order_type": self.client.ORDER_TYPE_LIMIT,
+                "price": float(trigger_price),
+                "transaction_type": "SELL",
+            },
         )
 
     def get_smart_order(self, smart_order_id):
