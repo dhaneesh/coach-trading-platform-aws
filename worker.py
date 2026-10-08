@@ -129,12 +129,24 @@ def execution_message(result):
         )
 
     if status == "TARGET_GTT_ACTIVE":
+        buy_average_price = (
+            result.get("buy_average_price")
+            or result.get("buyAveragePrice")
+            or "-"
+        )
+
+        gtt_target_price = (
+            result.get("gtt_target_price")
+            or result.get("gttTargetPrice")
+            or "-"
+        )
+
         return (
             "TRADE EXECUTED SUCCESSFULLY.\n\n"
             f"Symbol: {symbol}\n"
             f"Quantity: {quantity}\n"
-            f"BUY average price: ₹{result.get('buy_average_price', result.get('buyAveragePrice', '-'))}\n"
-            f"SELL target: ₹{result.get('gtt_target_price', result.get('gttTargetPrice', '-'))}\n"
+            f"BUY average price: ₹{buy_average_price}\n"
+            f"SELL target: ₹{gtt_target_price}\n"
             "SELL target GTT is ACTIVE.\n\n"
             "No further action is required."
         )
